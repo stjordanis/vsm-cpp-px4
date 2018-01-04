@@ -1,0 +1,296 @@
+/**
+
+@page vsm_user_guide Connecting PX4 autopilot to UgCS
+
+@image latex ugcs-logo.png "" width=3cm
+@image latex main-vsm-logo.png "" width=3cm
+
+
+@section first_time_connection First time vehicle connection
+
+See @ref vsm_disclaimer.
+
+Please follow these steps to connect an PX4 vehicle to the UgCS:
+
+1. PX4 vehicle must be properly configured, calibrated and
+tested using tools and instruction from the official
+[PX4 web site](http://www.px4.io) prior to using it with UgCS.
+UgCS does not support initial configuration, setup and calibration of PX4
+driven vehicles.
+
+2. If more than one PX4 vehicle is planned to be used with UgCS, it must
+be ensured that each vehicle has a unique system id as defined by the parameter
+_SYSID_THISMAV_, otherwise UgCS will not be able to distinguish between different
+vehicles and it will not be possible to operate vehicles normally. To change the
+parameter, please use the official PX4 configuration software like QGroundControl.
+
+3. Turn on the vehicle and plug in the radio modem paired with the vehicle or
+direct USB cable from the PX4 board to the computer where VSM is running.
+UgCS uses serial ports for communication with PX4 vehicles. Standard
+communication devices like 3DR radio modems (and their analogs) and direct USB
+connections are supported, as long as OS driver for virtual serial port is
+installed and serial port is successfully created. Please refer to your
+communication equipment manufacturer documentation about driver installation
+instructions.
+
+4. As soon as uplink and downlink connection is established, the vehicle should
+appear in the active vehicles list in main (map) view. Open _Vehicles_ window
+from main menu and choose the corresponding vehicle for editing by clicking on
+the menu item and selecting _Edit_ button. Now you can select the vehicle
+profile and change the default vehicle name to be convenient for you:
+@image html new-ardu-vehicle.png "New PX4 vehicle"
+@image latex new-ardu-vehicle.png "New PX4 vehicle" width=15cm
+Vehicle profile needs to be assigned to allow mission planning with this vehicle.
+Vehicle avatar should be assigned in vehicle profile to properly see the vehicle
+location on map.
+
+5. Repeat steps above for each your PX4 vehicle.
+
+Supported vehicle types:
+- Copters
+- VTOL vehicles
+
+Supported PX4 firmware versions:
+- 1.6.5
+
+@section mission_execution_specifics Mission execution specifics
+
+@subsection mission_actions Mission action support
+
+Flight plan element / action | Support | Notes
+-----------------------------|---------|---------
+Change speed    |  Yes | |
+Wait    |  Yes | |
+Panorama        |  No | | 
+Set camera mode |  Yes | |
+Set camera by time | Yes |  |
+Set camera by distance | Yes |  |
+Set camera attitude | Yes | |
+Set POI | No | |
+Change heading | Yes | See note below for VTOL specifics. |
+
+@note Change yaw for VTOL vehicles works only when hovering over the waypoint. Vehicle will always fly with nose pointing to next waypoint.<br>
+For Yaw action to succeed it must be used together with "Wait" action. 
+
+@subsection below_hl Flights below Home Location
+
+
+@warning PX4 does not support flying below Home Location. Make sure all route waypoints are above HL. See also @ref home_location.
+
+@section altitude Altitude
+
+PX4 reports two altitude types - AMSL (Above Mean Sea Level) and AHL (Above Home Location).
+Altitude AHL is displayed as Raw altitude in client.
+
+Vehicle altitude AMSL is calculated from Raw altitude as:
+
+_Vehicle altitude AMSL = Takeoff altitude + Reported altitude AHL_
+
+If Takeoff altitude is not specified in UgCS then:
+
+_Vehicle altitude AMSL = Reported altitude AMSL_
+ 
+Current altitude AGL (Above Ground Level) is calculated as:
+
+_Vehicle altitude AGL = Vehicle altitude AMSL - Terrain elevation AMSL at vehicle location_
+
+@section home_location Home Location (HL) support
+
+PX4 does not support setting HL from UgCS. HL is always automatically set to the current location when vehicle is armed.
+
+UgCS is able to read the current HL form the vehicle and is display it on the map. 
+
+@warning Route waypoint altitudes are calculated based on HL altitude. Thus it is crucially important to launch the vehicle from the planned HL.
+When operating in area with variable terrain altitude make sure the home location is specified correctly in the mission before upload.
+
+@note Safest way to set correct HL is to set it explicitly at the current vehicle position. 
+
+@subsection home_location_land Landing at Home Location
+
+Vehicle behavior (land or do not land) after returning at Home Location depends on on the autopilot configuration.
+
+@section command_execution_specifics Command execution specifics
+
+Command        | Support  | Notes
+---------------|----------|---------
+ARM            |  Yes     | Arms vehicle. |
+DISARM         |  Yes     | Disarms vehicle. |
+AUTOMODE       |  Yes     | Start mission from first waypoint. Sets vehicle into _Mission_ flight mode. |
+MANUALMODE     |  Yes     | Sets _Manual_ mode. |
+CLICK & GO     |  Yes     | Sets _Click & Go_ (single waypoint) mode. |
+JOYSTICK       |  No      | |
+HOLD           |  Yes     | Pause mission execution. The drone will loiter at its current position. |
+CONTINUE       |  Yes     | Continue with mission execution from next waypoint. Works from _Manual_ and _Click&Go_ modes.|
+RETURN HOME    |  Yes     | Vehicle will return to home location. See also @ref home_location. |
+TAKEOFF        |  Yes     | |
+LAND           |  Yes     | |
+EMERGENCYLAND  |  Yes     | |
+CAMERA_TRIGGER |  No      | |
+
+@section commands_shading Command shading
+
+UGCS Client can show command buttons in different shades. You can always press all buttons disregarding of shade. Highlighted buttons suggest recommended commands, depending on vehicle current status.
+
+@section telemetry_info Telemetry information specifics
+
+@subsection air_speed Air speed
+If there is no air speed sensor onboard, air speed will be shown as "Not available". If there is an air speed sensor onboard, the air speed value will be shown.
+
+@subsection rc_link_quality RC link quality
+
+RC Link quality reporting is not supported.
+
+@section fail-safe Fail-safe actions
+
+__GPS Lost:__
+
+This parameter is not supported. Vehicle will behave as specified. By default it will wait for 30s.
+If GPS signal does not restore vehicle will land. 
+
+__RC Lost:__
+Action		   |Result
+---------------|-------------------|
+Wait			| Aircraft changes altitude to failsafe altitude and returns home|
+Land			| Aircraft lands even if in loiter mode|
+Return Home		| Aircraft changes altitude to failsafe altitude and returns home|
+Continue		| Aircaft continues mission|
+
+__Battery Low:__
+Action		   |Result
+---------------|-------------------|
+Land			| Aircraft changes altitude to failsafe altitude and returns home|
+Return Home		| Aircraft changes altitude to failsafe altitude and returns home|
+Continue		| Aircaft continues mission|
+
+
+@section turn_type_specifics Waypoint turn types
+
+Turn type          | Support  | Notes
+-------------------|----------|---------
+Straight           |  Yes     | The vehicle will fly a straight line to the location specified as a lat, lon and altitude. |
+Spline             |  No     | |
+
+@section simulator_connection Connection to PX4 simulator
+
+PX4 VSM can be configured to connect to PX4 simulator via UDP connection on port 14550.
+Add this line to vsm-px4.conf file:
+
+    connection.udp_in.local_port = 14550
+
+Please refer to PX4 documentation on how to install and configure SITL (Software In The Loop) simulation: http://dev.px4.io/simulation-sitl.html
+
+@warning PX4 simulator must be launched before PX4 VSM is launched. Otherwise, if VSM is already running it will terminate the VSM when launched. This applies only to the case when VSM is running on the same host as simulation.
+
+@section zigbee_connection Connection using ZigBee interface
+
+There is a possibility to connect UgCS to PX4 vehicle using ZigBee
+interface. Connection is performed with two or more Digi XBee ZigBee modules (one
+on ground side, others on vehicles side) and dedicated UgCS software component
+called XBee Connector. Please refer to XBee Connector user guide for details.
+
+In order to use such kind of connection you are to disable
+@ref serial_port_parameters and enable @ref proxy_parameters.
+
+
+@section config_file_parameters_section Configuration file
+
+Default configuration file of the PX4 VSM suits most needs and it is
+generally not necessary to modify it.
+
+Configuration file location:
+
+- <b>On Microsoft Windows:</b>
+
+         C:\Program Files (x86)\UgCS\bin\vsm-px4.conf
+
+- <b>On GNU/Linux:</b>
+
+         /etc/opt/ugcs/vsm-px4.conf
+
+- <b>On Apple OS X:</b>
+
+          /Users/[user name]/Library/Application Support/UGCS/configuration/vsm-px4.conf
+
+@subsection common_params_section Common parameters
+
+All VSMs share a common set of configuration file parameters described in
+@ref common_config_file_params. PX4 VSM configuration file prefix is:
+
+    vehicle.px4
+
+@subsection connection_spec Communication channel configuration
+
+There must be at least one communication channel defined, otherwise VSM will not
+try to connect to the vehicle. See @ref vsm_comm_setup for details
+
+Default installation is configured to detect autopilot automatically on
+any available serial port at 57600 or 115Kbps.
+
+@subsection model_override_params Model name and serial number override
+
+Optional.
+
+- @b Name: vehicle.px4.custom.[name].system_id = [system id]
+- @b Name: vehicle.px4.custom.[name].model_name = [model name]
+- @b Name: vehicle.px4.custom.[name].serial_number = [serial number]
+- @b Description: In UgCS each vehicle is identified by a unique combination of
+model name and serial number represented as text strings. By default, PX4
+vehicles are identified with a model name _PX4_ and serial number equal with
+the Mavlink system id read from the vehicle. It can be overridden by these
+parameters, where [name] is an arbitrary vehicle name, [system id] is the
+original Mavlink system id which should be overridden, [model name] is a new
+model name to be visible to the UgCS, [serial number] is a new serial number to
+be visible to the UgCS.
+- @b Example:
+
+        vehicle.px4.custom.my_drone.system_id = 2
+        vehicle.px4.custom.my_drone.model_name = PX4Quad
+        vehicle.px4.custom.my_drone.serial_number = 123456
+
+@subsection camera_trigger_type parameter
+
+There are different ways to control camera payload in px4 family. First one is
+"common" one and utilizes SET_SERVO or REPEAT_SERVO commands. Camera trigger control
+is linked with autopilot servo output and triggering take place when we send
+proper amount of PWM signal in that oitput.
+
+Second one is when we use high level commands MAV_CMD_IMAGE_START_CAPTURE and MAV_CMD_IMAGE_STOP_CAPTURE
+to control triggering.
+
+So we introduce parameter
+
+            vehicle.px4.camera_trigger_type
+
+When it set to 0, VSM will use high level commands MAV_CMD_IMAGE_START_CAPTURE and MAV_CMD_IMAGE_STOP_CAPTURE
+And when it set to 1 - VSM will use MAV_CMD_DO_REPEAT_SERVO command along with camera_servo_idx,
+camera_servo_pwm and camera_servo_time parameter values.
+
+Note: Yuneec 520 with payload always override this parameter to 0 value.
+
+@subsection telem_rate Telemetry rate configuration
+
+PX4 VSM supports setting custom telemetry rates based on mavlink message type.
+There are 8 message types which are used by VSM to get the essential state info from vehicle:
+<b>SYS_STATUS, GLOBAL_POSITION_INT, ATTITUDE, VFR_HUD, GPS_RAW_INT, ALTITUDE, HEARTBEAT, HOME_POSITION</b>.
+
+Other messages which are sent by autopilot are disabled by VSM to save datalink channel bandwidth.
+
+It is possible to configure rate for each message type separately.
+
+- @b Required: No.
+- @b Supported @b values: 0.1 - 50.0
+- @b Default: 2
+- @b Description: Message count per second.
+
+- @b Example:
+
+        vehicle.px4.telemetry_rate.ALTITUDE = 0.5
+        vehicle.px4.telemetry_rate.ATTITUDE = 0.5
+        vehicle.px4.telemetry_rate.GLOBAL_POSITION_INT = 0.5
+        vehicle.px4.telemetry_rate.GPS_RAW_INT = 0.5
+        vehicle.px4.telemetry_rate.HEARTBEAT = 0.5
+        vehicle.px4.telemetry_rate.HOME_POSITION = 0.5
+        vehicle.px4.telemetry_rate.SYS_STATUS = 0.5
+        vehicle.px4.telemetry_rate.VFR_HUD = 0.5
+
+*/
