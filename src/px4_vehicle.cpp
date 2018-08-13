@@ -1,11 +1,8 @@
-// Copyright (c) 2017, Smart Projects Holdings Ltd
+// Copyright (c) 2018, Smart Projects Holdings Ltd
 // All rights reserved.
 // See LICENSE file for license details.
 
 #include <px4_vehicle.h>
-
-const ugcs::vsm::Mavlink_demuxer::System_id Mavlink_vehicle::VSM_SYSTEM_ID = 255;
-const ugcs::vsm::Mavlink_demuxer::Component_id Mavlink_vehicle::VSM_COMPONENT_ID = 0;
 
 constexpr std::chrono::milliseconds Px4_vehicle::RC_OVERRIDE_PERIOD;
 constexpr std::chrono::milliseconds Px4_vehicle::RC_OVERRIDE_TIMEOUT;
@@ -14,13 +11,16 @@ constexpr float Px4_vehicle::MAX_COPTER_SPEED;
 
 using namespace ugcs::vsm;
 
+const Mavlink_demuxer::System_id Mavlink_vehicle::VSM_SYSTEM_ID = 255;
+const Mavlink_demuxer::Component_id Mavlink_vehicle::VSM_COMPONENT_ID = 0;
+
 void
 Px4_vehicle::On_enable()
 {
     // Get parameter values.
     Mavlink_vehicle::On_enable();
 
-    c_mission_upload->Set_available();  // always available
+    c_mission_upload->Set_available();
     c_arm->Set_available();
     c_land_command->Set_available();
     c_emergency_land->Set_available();
@@ -49,10 +49,14 @@ Px4_vehicle::On_enable()
         proto::FAILSAFE_ACTION_LAND
         });
 
-    c_transition_fixed = Add_command(subsystems.fc, "transition_fixed", false, true);
-    c_transition_vtol = Add_command(subsystems.fc, "transition_vtol", false, true);
+    c_transition_fixed = flight_controller->Add_command("transition_fixed", true);
+    c_transition_vtol = flight_controller->Add_command("transition_vtol", true);
 
     Commit_to_ucs();    // push state info.
+
+    if (use_mavlink_2 && *use_mavlink_2) {
+        mav_stream->Set_mavlink_v2(true);
+    }
 
     read_waypoints.item_handler = Read_waypoints::Make_mission_item_handler(
         &Px4_vehicle::On_mission_item,
@@ -109,7 +113,6 @@ Px4_vehicle::On_enable()
             Shared_from_this()),
             real_system_id);
 
-
     // Get autopilot version
     auto cmd_long = mavlink::Pld_command_long::Create();
     (*cmd_long)->target_component = real_component_id;
@@ -118,9 +121,13 @@ Px4_vehicle::On_enable()
     (*cmd_long)->param1 = 1;    // request version.
     (*cmd_long)->confirmation = 0;
 
-    // Send request in both formats. On response VSM will settle on mavlink version.
-    Send_message_v2(*cmd_long);
-    Send_message_v1(*cmd_long);
+    if (use_mavlink_2) {
+        Send_message(*cmd_long);
+    } else {
+        // Send request in both formats. On response VSM will settle on mavlink version.
+        Send_message_v1(*cmd_long);
+        Send_message_v2(*cmd_long);
+    }
 }
 
 bool
@@ -131,6 +138,9 @@ Px4_vehicle::Default_mavlink_handler(
     uint8_t,
     uint8_t)
 {
+    if (!set_message_interval_supported) {
+        return false;
+    }
     // Turn off messages which we do not want to see any more.
     static const std::unordered_set<int> msgs = {
         mavlink::HIGHRES_IMU,
@@ -164,7 +174,7 @@ Px4_vehicle::On_disable()
 
 void
 Px4_vehicle::On_autopilot_version(
-    ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::AUTOPILOT_VERSION>::Ptr ver)
+    mavlink::Message<mavlink::MESSAGE_ID::AUTOPILOT_VERSION>::Ptr ver)
 {
     int maj = (ver->payload->flight_sw_version.Get() >> 24) & 0xff;
     int min = (ver->payload->flight_sw_version.Get() >> 16) & 0xff;
@@ -172,12 +182,18 @@ Px4_vehicle::On_autopilot_version(
     int type = (ver->payload->flight_sw_version.Get() >> 0) & 0xff;
     LOG("PX4 version=%d.%d.%d, type=%d", maj, min, patch, type);
 
-
     if ((ver->payload->capabilities & mavlink::MAV_PROTOCOL_CAPABILITY_MAVLINK2)
-        && !mav_stream->Is_mavlink_v2()) {
+        && !mav_stream->Is_mavlink_v2()
+        && !use_mavlink_2)
+    {
         mav_stream->Set_mavlink_v2(true);
         LOG_INFO("Enabled MAVLINK2");
     }
+
+    if (maj > 1 || (maj == 1 && min >= 4)) {
+        set_message_interval_supported = true;
+    }
+
     if (!protocol_version_detected) {
         protocol_version_detected = true;
         auto cmd_long_set_mode = mavlink::Pld_command_long::Create();
@@ -193,7 +209,7 @@ Px4_vehicle::On_autopilot_version(
 
 void
 Px4_vehicle::On_camera_information(
-    ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::CAMERA_INFORMATION>::Ptr camera)
+    mavlink::Message<mavlink::MESSAGE_ID::CAMERA_INFORMATION>::Ptr camera)
 {
     // override camera trigger type
     camera_trigger_type = 0;
@@ -219,7 +235,7 @@ Px4_vehicle::On_camera_information(
 
 void
 Px4_vehicle::On_image_captured(
-    ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::CAMERA_IMAGE_CAPTURED>::Ptr message)
+    mavlink::Message<mavlink::MESSAGE_ID::CAMERA_IMAGE_CAPTURED>::Ptr message)
 {
     auto p = message->payload;
     if (p->capture_result == 1) {
@@ -268,18 +284,26 @@ Px4_vehicle::On_home_position(mavlink::Message<mavlink::MESSAGE_ID::HOME_POSITIO
 
 void
 Px4_vehicle::On_parameter(
-    ugcs::vsm::mavlink::Message<mavlink::MESSAGE_ID::PARAM_VALUE>::Ptr m)
+    mavlink::Message<mavlink::MESSAGE_ID::PARAM_VALUE>::Ptr m)
 {
     const auto &name = m->payload->param_id.Get_string();
 
     if (name == "SYS_AUTOSTART") {
         float v = m->payload->param_value.Get();
+        // PX4 copies int values into float directly without conversion.
         const int32_t *model = reinterpret_cast<int32_t *>(&v);
         if (*model == MODEL_TYPHOON_H520) {
             vendor = Px4_vendor::YUNEEC;
             LOG_INFO("UAV model: Typhoon H520, vendor: Yuneec");
+            Set_frame_type("yuneec_h520");
+        }
+
+        // Register vehicle with ugcs once we have frame type.
+        if (!Is_registered()) {
+            Register();
         }
     } else if (name == "GF_ACTION") {
+        // This works because float zero is the same bitwise representation as int zero.
         t_fence_enabled->Set_value(m->payload->param_value.Get() != 0);
         Commit_to_ucs();
     } else if (name == "MPC_XY_VEL_MAX") {
@@ -297,7 +321,7 @@ Px4_vehicle::Download_mission()
 }
 
 void
-Px4_vehicle::On_mission_item(ugcs::vsm::mavlink::Pld_mission_item mi)
+Px4_vehicle::On_mission_item(mavlink::Pld_mission_item mi)
 {
     current_command_map.Accumulate_route_id(Get_mission_item_hash(mi));
 //    VEHICLE_LOG_DBG(*this, "Item %d received. mission_id=%08X", mi->seq.Get(), current_command_map.Get_route_id());
@@ -326,13 +350,17 @@ Px4_vehicle::On_mission_downloaded(bool, std::string)
 void
 Px4_vehicle::Initialize_telemetry()
 {
-    for (auto it : telemetry_rates)
-    {
-        // Send message twice to be sure.
-        // TODO: Rework this to verify the actual interval used by px4.
-        // Need to refactor the Send_message to include response handler.
-        Set_message_interval(it.first, 1000000.0 / it.second);
-        Set_message_interval(it.first, 1000000.0 / it.second);
+    if (set_message_interval_supported) {
+        for (auto it : telemetry_rates)
+        {
+            // Send message twice to be sure.
+            // TODO: Rework this to verify the actual interval used by px4.
+            // Need to refactor the Send_message to include response handler.
+            Set_message_interval(it.first, 1000000.0 / it.second);
+            Set_message_interval(it.first, 1000000.0 / it.second);
+        }
+    } else {
+        Mavlink_vehicle::Initialize_telemetry();
     }
 }
 
@@ -366,7 +394,7 @@ Px4_vehicle::Get_type() const
 }
 
 Px4_vehicle::Type
-Px4_vehicle::Get_type(ugcs::vsm::mavlink::MAV_TYPE type)
+Px4_vehicle::Get_type(mavlink::MAV_TYPE type)
 {
     switch (type) {
     case mavlink::MAV_TYPE::MAV_TYPE_QUADROTOR:
@@ -450,7 +478,8 @@ Px4_vehicle::Vehicle_command_act::Try()
 
     current_timeout = retry_timeout;
 
-    auto current_control_mode = px4_vehicle.Get_system_status().control_mode;
+    int current_control_mode;
+    vehicle.t_control_mode->Get_value(current_control_mode);
 
     cmd_messages.clear();
 
@@ -458,7 +487,7 @@ Px4_vehicle::Vehicle_command_act::Try()
 
     switch (request_type) {
     case Vehicle_command::Type::ARM:
-        if (!vehicle.Is_armed() && current_control_mode == Sys_status::Control_mode::AUTO) {
+        if (!vehicle.Is_armed() && current_control_mode == proto::CONTROL_MODE_AUTO) {
             vehicle_command_request.Fail("Arming disabled while in AUTO mode");
             break;
         }
@@ -546,25 +575,29 @@ Px4_vehicle::Vehicle_command_act::Try()
                     static_cast<uint8_t>(Px4_main_mode::AUTO),
                     static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_TAKEOFF));
             }
-            if (current_control_mode != Sys_status::Control_mode::GUIDED) {
+            if (current_control_mode != proto::CONTROL_MODE_CLICK_GO) {
                 Set_mode(
                     static_cast<uint8_t>(Px4_main_mode::AUTO),
                     static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_LOITER));
             }
-            auto param = mavlink::Pld_param_set::Create();
-            Fill_target_ids(*param);
-            (*param)->param_id = "MPC_XY_CRUISE";
-            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-            (*param)->param_value = vehicle_command_request->Get_speed();
-            cmd_messages.emplace_back(param);
 
-            if (px4_vehicle.max_ground_speed < vehicle_command_request->Get_speed()) {
-                (*param)->param_id = "MPC_XY_VEL_MAX";
+            if (px4_vehicle.vendor == Px4_vendor::YUNEEC) {
+                VEHICLE_LOG_WRN(vehicle, "Ignoring speed setting as MPC_XY_CRUISE is not supported by Yuneec.");
+            } else {
+                auto param = mavlink::Pld_param_set::Create();
+                Fill_target_ids(*param);
+                (*param)->param_id = "MPC_XY_CRUISE";
                 (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
                 (*param)->param_value = vehicle_command_request->Get_speed();
                 cmd_messages.emplace_back(param);
-            }
 
+                if (px4_vehicle.max_ground_speed < vehicle_command_request->Get_speed()) {
+                    (*param)->param_id = "MPC_XY_VEL_MAX";
+                    (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
+                    (*param)->param_value = vehicle_command_request->Get_speed();
+                    cmd_messages.emplace_back(param);
+                }
+            }
 
             Do_reposition(
                 vehicle_command_request->Get_latitude(),
@@ -589,7 +622,7 @@ Px4_vehicle::Vehicle_command_act::Try()
         break;
 
     case Vehicle_command::Type::JOYSTICK_CONTROL_MODE: // TODO: Unused at the moment, implement in future
-        if (current_control_mode == Sys_status::Control_mode::GUIDED) {
+        if (current_control_mode == proto::CONTROL_MODE_CLICK_GO) {
             vehicle_command_request.Succeed();
         } else {
             Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_LOITER));
@@ -598,7 +631,7 @@ Px4_vehicle::Vehicle_command_act::Try()
         break;
 
     case Vehicle_command::Type::DIRECT_VEHICLE_CONTROL: {  // TODO: Unused at the moment, implement in future
-        if (current_control_mode != Sys_status::Control_mode::GUIDED) {
+        if (current_control_mode != proto::CONTROL_MODE_CLICK_GO) {
             break;
         }
         px4_vehicle.direct_vehicle_control_last_received = std::chrono::steady_clock::now();
@@ -840,7 +873,6 @@ Px4_vehicle::Vehicle_command_act::On_param_value(
 
     if (cmd_messages.size()) {
         std::string param_name;
-        mavlink::Float param_value;
         // we are waiting for response.
         auto cmd = cmd_messages.front();
         switch (cmd->Get_id()) {
@@ -853,7 +885,7 @@ Px4_vehicle::Vehicle_command_act::On_param_value(
         case mavlink::MESSAGE_ID::PARAM_SET:
             param_name = (*std::static_pointer_cast<mavlink::Pld_param_set>(cmd))->param_id.Get_string();
             if (message->payload->param_id.Get_string() == param_name) {
-                param_value = (*std::static_pointer_cast<mavlink::Pld_param_set>(cmd))->param_value.Get();
+                auto param_value = (*std::static_pointer_cast<mavlink::Pld_param_set>(cmd))->param_value.Get();
                 if (message->payload->param_value.Get() == param_value) {
                     Send_next_command();
                 } else {
@@ -868,7 +900,7 @@ Px4_vehicle::Vehicle_command_act::On_param_value(
 
 void
 Px4_vehicle::Vehicle_command_act::On_status_text(
-        ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::STATUSTEXT>::Ptr)
+        mavlink::Message<mavlink::MESSAGE_ID::STATUSTEXT>::Ptr)
 {
     /* Assumed command execution started, so wait longer. */
     if (current_timeout < extended_retry_timeout) {
@@ -967,14 +999,50 @@ Px4_vehicle::Vehicle_command_act::Unregister_status_text()
 void
 Px4_vehicle::Task_upload::Enable(Vehicle_task_request::Handle request)
 {
+    // Clean state.
+    prepared_actions.clear();
+    task_attributes.clear();
+    current_mission_poi.Disengage();
+    current_mission_heading.Disengage();
+    first_mission_poi_set = false;
+    restart_mission_poi = false;
+    current_heading = 0.0;
+    current_speed = -1;
+    heading_to_this_wp = 0.0;
+    camera_series_by_dist_active = false;
+    camera_series_by_dist_active_in_wp = false;
+    camera_series_by_time_active = false;
+    camera_series_by_time_active_in_wp = false;
+    max_mission_speed = 0;
+
+    if (px4_vehicle.vendor == Px4_vendor::YUNEEC) {
+        if (request->attributes->rc_loss != Task_attributes_action::DO_NOT_CHANGE ||
+            request->attributes->gnss_loss != Task_attributes_action::DO_NOT_CHANGE ||
+            request->attributes->low_battery != Task_attributes_action::DO_NOT_CHANGE)
+        {
+            request.Fail("Failsafe actions not supported by Yuneec");
+            Disable();
+            return;
+        }
+    }
+
     float hl;
     // HL altitude becomes altitude origin.
     // Need to set at the very beginning as it is used to specify safe_altitude, too.
     if (vehicle.t_home_altitude_amsl->Get_value(hl)) {
+        vehicle.Add_status_message("Using current HL altitude as altitude origin for the route.");
+        VEHICLE_LOG_WRN(
+            vehicle,
+            "Using current HL altitude %f m as altitude origin for route.",
+            hl);
         request->Set_takeoff_altitude(hl);
     } else {
-        request.Fail("No Home Location available");
-        return;
+        // Older PX4 firmware does not report HL.
+        vehicle.Add_status_message("Cannot determine Home Location. Using altitude origin from route.");
+        VEHICLE_LOG_WRN(
+            vehicle,
+            "Cannot determine Home Location. Using altitude origin %f m from route.",
+            request->Get_takeoff_altitude());
     }
 
     this->request = request;
@@ -1277,52 +1345,48 @@ Px4_vehicle::Task_upload::Prepare_task_attributes()
 void // ?
 Px4_vehicle::Task_upload::Prepare_copter_task_attributes()
 {
-    mavlink::Pld_param_set param;
-    Fill_target_ids(param);
     using Emerg = Task_attributes_action::Emergency_action;
 
     /* Battery failsafe. */
     if (request->attributes->low_battery != Emerg::DO_NOT_CHANGE) {
-        param->param_id = "COM_LOW_BAT_ACT";
-        param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT32;
+        int low_batt;
         switch (request->attributes->low_battery) {
         case Emerg::GO_HOME:
-            param->param_value = BATT_FS_RTH;
+            low_batt = BATT_FS_RTH;
             break;
         case Emerg::LAND:
-            param->param_value = BATT_FS_LAND;
+            low_batt = BATT_FS_LAND;
             break;
         case Emerg::CONTINUE:
-            param->param_value = BATT_FS_WARNING;
+            low_batt = BATT_FS_WARNING;
             break;
         default:
             /* There is no support for such behavior. Override with gohome. */
             VEHICLE_LOG_WRN(vehicle, "Unsupported FS action %d. using gohome", request->attributes->low_battery);
-            param->param_value = BATT_FS_RTH;
+            low_batt = BATT_FS_RTH;
             break;
         }
-        task_attributes.push_back(param);
+        task_attributes.Append_int_px4("COM_LOW_BAT_ACT", low_batt);
     }
 
     /* RC loss failsafe. */
     if (request->attributes->rc_loss != Emerg::DO_NOT_CHANGE) {
-        param->param_id = "NAV_RCL_ACT";
-        param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT32;
+        int rc_loss;
         switch (request->attributes->rc_loss) {
         case Emerg::WAIT:
-            param->param_value = RC_FS_LOITER;
+            rc_loss = RC_FS_LOITER;
             break;
         case Emerg::LAND:
-            param->param_value = RC_FS_LAND;
+            rc_loss = RC_FS_LAND;
             break;
         case Emerg::GO_HOME:
-            param->param_value = RC_FS_RTH;
+            rc_loss = RC_FS_RTH;
             break;
         default:
-            param->param_value = RC_FS_DISABLED;
+            rc_loss = RC_FS_DISABLED;
             break;
         }
-        task_attributes.push_back(param);
+        task_attributes.Append_int_px4("NAV_RCL_ACT", rc_loss);
     }
 
     if (std::isnan(request->attributes->safe_altitude)) {
@@ -1336,105 +1400,34 @@ Px4_vehicle::Task_upload::Prepare_copter_task_attributes()
         }
 
         /* RTL altitude. */
-        param->param_id = "RTL_RETURN_ALT";
-        param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-        param->param_value = safe_alt;
-        task_attributes.push_back(param);
+        task_attributes.Append_float("RTL_RETURN_ALT", safe_alt);
 
-
-        /* RTL descend altitude.
-           YUNEEC doesn't allow to change this parameter
-        */
-        if (px4_vehicle.vendor != Px4_vendor::YUNEEC) {
-            param->param_id = "RTL_DESCEND_ALT";
-            param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-            param->param_value = safe_alt;
-            task_attributes.push_back(param);
-        }
+        // Do not set RTL_DESCEND_ALT to safe_alt because it makes vehicle
+        // to descend at landing speed which is much slower than descent speed.
+        // (YUNEEC doesn't allow to change this parameter at all)
     }
 
     // YUNEEC doesn't allow to change this parameters
     if (px4_vehicle.vendor != Px4_vendor::YUNEEC) {
         // Maximum speed in mission
         if (px4_vehicle.max_ground_speed < max_mission_speed) {
-            param->param_id = "MPC_XY_VEL_MAX";
-            param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-            param->param_value = max_mission_speed;
-            task_attributes.push_back(param);
+            task_attributes.Append_float("MPC_XY_VEL_MAX", max_mission_speed);
         }
-        // Set yaw mode to WP-defined
-        param->param_id = "MIS_YAWMODE";
-        param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT32;
-        param->param_value = 0; // Heading as set by waypoint
-        task_attributes.push_back(param);
+
+        // Do not modify MIS_YAWMODE if autoheading is not set.
+        if (px4_vehicle.autoheading) {
+            // Set yaw mode to WP-defined
+            task_attributes.Append_int_px4("MIS_YAWMODE", YAWMODE_WP_DEFINED);
+        }
     }
 }
 
 void // ?
 Px4_vehicle::Task_upload::Prepare_plane_task_attributes()
 {
-    /* Add plane specific task attributes */
-    mavlink::Pld_param_set param;
-    Fill_target_ids(param);
-    float v;    // All my parameters are float.
-    for (auto & p : request->parameters) {
-        if (p.second->Get_value(v)) {
-            if        (p.first == "landing_flare_altitude") {
-                param->param_id = "LAND_FLARE_ALT";
-                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-                param->param_value = v;
-            } else if (p.first == "landing_flare_time") {
-                param->param_id = "LAND_FLARE_SEC";
-                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-                param->param_value = v;
-            } else if (p.first == "min_landing_pitch") {
-                param->param_id = "LAND_PITCH_CD";
-                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT16;
-                param->param_value = static_cast<int16_t>(v * 18000 / M_PI);
-            } else if (p.first == "landing_flare_damp") {
-                param->param_id = "TECS_LAND_DAMP";
-                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-                param->param_value = v;
-            } else if (p.first == "landing_approach_airspeed") {
-                param->param_id = "TECS_LAND_ARSPD";
-                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-                param->param_value = v;
-            } else if (p.first == "landing_speed_weighting") {
-                param->param_id = "TECS_LAND_SPDWGT";
-                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-                param->param_value = v;
-            } else if (p.first == "max_auto_flight_pitch") {
-                param->param_id = "TECS_PITCH_MAX";
-                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-                param->param_value = static_cast<int8_t>(v * 180 / M_PI);
-            } else if (p.first == "max_pitch") {
-                param->param_id = "LIM_PITCH_MAX";
-                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT16;
-                param->param_value = static_cast<int16_t>(v * 180 / M_PI);
-            } else if (p.first == "min_throttle") {
-                param->param_id = "THR_MIN";
-                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-                param->param_value = static_cast<int8_t>(v);
-            } else if (p.first == "landing_sink_rate") {
-                param->param_id = "TECS_LAND_SINK";
-                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-                param->param_value = v;
-            } else if (p.first == "landing_rangefinder_enabled") {
-                param->param_id = "RNGFND_LANDING";
-                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-                param->param_value = static_cast<int8_t>(v);
-            } else if (p.first == "min_rangefinder_distance") {
-                param->param_id = "RNGFND_MIN_CM";
-                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT16;
-                param->param_value = static_cast<int16_t>(v);
-            } else {
-                VEHICLE_LOG_WRN(vehicle, "Unsupported parameter %s received.", p.first.c_str());
-            }
-            task_attributes.push_back(param);
-        } else {
-            VEHICLE_LOG_WRN(vehicle, "Invalid value for parameter %s", p.first.c_str());
-        }
-    }
+    // Ardupilot VSM parses the request->parameters here
+    // and sets respective parameters on the autopilot.
+    // TODO: implement once we support PX4 planes.
 }
 
 void // ?
@@ -1577,8 +1570,12 @@ Px4_vehicle::Task_upload::Prepare_move(Action::Ptr& action)
         }
         if ((last_move_action || takeoff_action) && px4_vehicle.Get_type() == Type::COPTER) {
             // Autoheading is copter specific.
-            LOG("Set Autoheading to %f", current_heading);
-            to->heading = current_heading;
+            if (px4_vehicle.autoheading) {
+                LOG("Set Autoheading to %f", current_heading);
+                to->heading = current_heading;
+            } else {
+                to->heading = NAN;
+            }
         }
     }
 
@@ -1601,7 +1598,7 @@ Px4_vehicle::Task_upload::Prepare_wait(Action::Ptr& action)
     /* Create additional waypoint on the current position to wait. */
     if (last_move_action) {
         auto wp = Build_wp_mission_item(last_move_action);
-        if (!current_mission_poi) {
+        if (!current_mission_poi && px4_vehicle.autoheading) {
             (*wp)->param4 = (Normalize_angle_0_2pi(current_heading) * 180.0) / M_PI;
         }
         first_mission_poi_set = false;
@@ -1625,7 +1622,7 @@ Px4_vehicle::Task_upload::Prepare_takeoff(Action::Ptr& action)
 {
     auto takeoff = action->Get_action<Action::Type::TAKEOFF>();
     mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-    if (vehicle.vehicle_type == ugcs::vsm::proto::VEHICLE_TYPE_VTOL) {
+    if (vehicle.Is_vehicle_type(proto::VEHICLE_TYPE_VTOL)) {
         (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_VTOL_TAKEOFF;
     } else {
         (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_TAKEOFF;
@@ -1642,7 +1639,7 @@ Px4_vehicle::Task_upload::Prepare_landing(Action::Ptr& action)
     auto land = action->Get_action<Action::Type::LANDING>();
 
     mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-    if (vehicle.vehicle_type == ugcs::vsm::proto::VEHICLE_TYPE_VTOL) {
+    if (vehicle.Is_vehicle_type(proto::VEHICLE_TYPE_VTOL)) {
         (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_VTOL_LAND;
     } else {
         (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_LAND;
@@ -1658,7 +1655,7 @@ Px4_vehicle::Task_upload::Prepare_landing(Action::Ptr& action)
 void
 Px4_vehicle::Task_upload::Prepare_vtol_transition(Action::Ptr& action)
 {
-    if (vehicle.vehicle_type == ugcs::vsm::proto::VEHICLE_TYPE_VTOL) {
+    if (vehicle.Is_vehicle_type(proto::VEHICLE_TYPE_VTOL)) {
         auto a = action->Get_action<Action::Type::VTOL_TRANSITION>();
         mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
         (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_VTOL_TRANSITION;
@@ -1680,6 +1677,12 @@ void
 Px4_vehicle::Task_upload::Prepare_change_speed(Action::Ptr& action)
 {
     Change_speed_action::Ptr la = action->Get_action<Action::Type::CHANGE_SPEED>();
+    if (fabs(current_speed - la->speed) < CHANGE_SPEED_TRESHOLD) {
+        // Do not generate change_speed if the change is too small.
+        return;
+    }
+    current_speed = la->speed;
+
     mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_CHANGE_SPEED;
     switch (px4_vehicle.Get_type()) {
@@ -1751,7 +1754,7 @@ Px4_vehicle::Task_upload::Prepare_camera_series_by_distance(Action::Ptr& action)
 }
 
 void
-Px4_vehicle::Task_upload::Prepare_camera_mode(ugcs::vsm::mavlink::CAMERA_MODE mode)
+Px4_vehicle::Task_upload::Prepare_camera_mode(mavlink::CAMERA_MODE mode)
 {
     int new_camera_mode = static_cast<int>(mode);
     if (!current_camera_mode || new_camera_mode != *current_camera_mode) {
@@ -1786,7 +1789,7 @@ Px4_vehicle::Task_upload::Prepare_camera_trigger_impl(bool multiply_photos, floa
         (*mi)->param4 = multiply_photos ? interval_in_seconds : px4_vehicle.camera_servo_time;
         Add_mission_item(mi);
     } else {
-        Prepare_camera_mode(ugcs::vsm::mavlink::CAMERA_MODE::CAMERA_MODE_IMAGE);
+        Prepare_camera_mode(mavlink::CAMERA_MODE::CAMERA_MODE_IMAGE);
 
         mavlink::Pld_mission_item::Ptr mi_start_capture = mavlink::Pld_mission_item::Create();
         (*mi_start_capture)->target_system = px4_vehicle.real_system_id;
@@ -1802,7 +1805,7 @@ Px4_vehicle::Task_upload::Prepare_camera_trigger_impl(bool multiply_photos, floa
 }
 
 void Px4_vehicle::Task_upload::Prepare_camera_recording_impl(bool start_recording) {
-    Prepare_camera_mode(ugcs::vsm::mavlink::CAMERA_MODE::CAMERA_MODE_VIDEO);
+    Prepare_camera_mode(mavlink::CAMERA_MODE::CAMERA_MODE_VIDEO);
 
     mavlink::Pld_mission_item::Ptr mi_start_capture = mavlink::Pld_mission_item::Create();
     if (start_recording) {
@@ -1835,20 +1838,21 @@ Px4_vehicle::Task_upload::Prepare_camera_trigger(Action::Ptr& action)
 {
     Camera_trigger_action::Ptr a =
         action->Get_action<Action::Type::CAMERA_TRIGGER>();
-    if (a->state == Camera_trigger_action::State::SINGLE_PHOTO ||
-
-        a->state == Camera_trigger_action::State::SERIAL_PHOTO) {
-        if (a->state == Camera_trigger_action::State::SINGLE_PHOTO) {
-            Prepare_camera_trigger_impl(false);
+    switch (a->state) {
+    case proto::CAMERA_MISSION_TRIGGER_STATE_SINGLE_PHOTO:
+        Prepare_camera_trigger_impl(false);
+        break;
+    case proto::CAMERA_MISSION_TRIGGER_STATE_SERIAL_PHOTO:
+        Prepare_camera_trigger_impl(true, static_cast<float>(a->interval.count()) / 1000.0);
+        break;
+    case proto::CAMERA_MISSION_TRIGGER_STATE_OFF:
+    case proto::CAMERA_MISSION_TRIGGER_STATE_ON:
+        if (px4_vehicle.camera_trigger_type == 0) {
+            Prepare_camera_recording_impl(a->state == proto::CAMERA_MISSION_TRIGGER_STATE_ON);
         } else {
-            Prepare_camera_trigger_impl(true, static_cast<float>(a->interval.count()) / 1000.0);
+            VEHICLE_LOG_WRN(vehicle, "Unsupported camera trigger state %d ignored.", a->state);
         }
-    } else if ((a->state == Camera_trigger_action::State::ON ||
-        a->state == Camera_trigger_action::State::OFF) && (px4_vehicle.camera_trigger_type == 0)) {
-            Prepare_camera_recording_impl(a->state == Camera_trigger_action::State::ON);
-    } else {
-        VEHICLE_LOG_WRN(vehicle, "Unsupported camera trigger state %d ignored.", a->state);
-                return;
+        break;
     }
 }
 
@@ -1913,17 +1917,14 @@ Px4_vehicle::Task_upload::Build_wp_mission_item(Action::Ptr& action)
 
 void
 Px4_vehicle::Process_heartbeat(
-            ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::HEARTBEAT>::Ptr message)
+            mavlink::Message<mavlink::MESSAGE_ID::HEARTBEAT>::Ptr message)
 {
-    // skip wrong heartbeat
-    if (message->payload->autopilot.Get() == 0) {
+    // Process heartbeats only from vehicle
+    if (!Is_vehicle_heartbeat_valid(message)) {
         return;
     }
 
     auto base_mode = Get_base_mode();
-
-    auto status = Get_system_status();
-
     if (base_mode & mavlink::MAV_MODE_FLAG::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED) {
         auto new_mode = message->payload->custom_mode.Get();
         if (native_flight_mode.data != new_mode) {
@@ -1932,10 +1933,10 @@ Px4_vehicle::Process_heartbeat(
             const auto main_mode = static_cast<Px4_main_mode>(native_flight_mode.main_mode);
             const auto sub_mode = static_cast<Px4_auto_sub_mode>(native_flight_mode.sub_mode);
             if (main_mode == Px4_main_mode::AUTO) {
-                status.control_mode = Sys_status::Control_mode::AUTO;
+                t_control_mode->Set_value(proto::CONTROL_MODE_AUTO);
                 switch (sub_mode) {
                 case Px4_auto_sub_mode::AUTO_LOITER:
-                    status.control_mode = Sys_status::Control_mode::GUIDED;
+                    t_control_mode->Set_value(proto::CONTROL_MODE_CLICK_GO);
                     current_flight_mode = proto::FLIGHT_MODE_HOLD;
                     break;
                 case Px4_auto_sub_mode::AUTO_LAND:
@@ -1955,7 +1956,8 @@ Px4_vehicle::Process_heartbeat(
                     break;
                 }
             } else {
-                status.control_mode = Sys_status::Control_mode::MANUAL;
+                current_flight_mode.Disengage();
+                t_control_mode->Set_value(proto::CONTROL_MODE_MANUAL);
             }
             VEHICLE_LOG_INF((*this),
                 "Native flight mode changed to %s (%04X)",
@@ -1966,28 +1968,29 @@ Px4_vehicle::Process_heartbeat(
     } else if (base_mode & mavlink::MAV_MODE_FLAG::MAV_MODE_FLAG_AUTO_ENABLED) {
         // Handle case when px4 is disarmed without RC connected.
         if (Is_armed()) {
-            status.control_mode = Sys_status::Control_mode::AUTO;
+            t_control_mode->Set_value(proto::CONTROL_MODE_AUTO);
         } else {
-            status.control_mode = Sys_status::Control_mode::MANUAL;
+            t_control_mode->Set_value(proto::CONTROL_MODE_MANUAL);
         }
     } else if (base_mode & mavlink::MAV_MODE_FLAG::MAV_MODE_FLAG_MANUAL_INPUT_ENABLED) {
-        status.control_mode = Sys_status::Control_mode::MANUAL;
+        t_control_mode->Set_value(proto::CONTROL_MODE_AUTO);
     } else if (base_mode & mavlink::MAV_MODE_FLAG::MAV_MODE_FLAG_GUIDED_ENABLED) {
-        status.control_mode = Sys_status::Control_mode::GUIDED;
+        t_control_mode->Set_value(proto::CONTROL_MODE_CLICK_GO);
     } else {
-        status.control_mode = Sys_status::Control_mode::UNKNOWN;
+        t_control_mode->Set_value_na();
     }
 
-    Sys_status::State new_state(Sys_status::State::UNKNOWN);
+    bool was_armed = false;
+    t_is_armed->Get_value(was_armed);
 
     if (Is_armed()) {
-        new_state = Sys_status::State::ARMED;
-        if (new_state != status.state) {
+        t_is_armed->Set_value(true);
+        if (!was_armed) {
             VEHICLE_LOG_INF(*this, "Vehicle ARMED");
         }
     } else {
-        new_state = Sys_status::State::DISARMED;
-        if (new_state != status.state) {
+        t_is_armed->Set_value(false);
+        if (was_armed) {
             VEHICLE_LOG_INF(*this, "Vehicle DISARMED");
         }
     }
@@ -1998,27 +2001,24 @@ Px4_vehicle::Process_heartbeat(
         t_flight_mode->Set_value_na();
     }
 
-    status.state = new_state;
-    status.downlink_connected = true;
-    status.uplink_connected = true;
-
-    Set_system_status(status);
     Update_capability_states();
 }
 
 void
 Px4_vehicle::Update_capability_states()
 {
-    auto status = Get_system_status();
+    int current_control_mode;
+    t_control_mode->Get_value(current_control_mode);
+
     c_direct_payload_control->Set_enabled(true);
 
-    c_manual->Set_enabled(status.control_mode != Sys_status::Control_mode::MANUAL);
+    c_manual->Set_enabled(current_control_mode != proto::CONTROL_MODE_MANUAL);
     c_disarm->Set_enabled(Is_armed() && !is_airborne);
     if (Is_armed() && is_airborne) {
         c_waypoint->Set_enabled();
         c_emergency_land->Set_enabled();
         c_auto->Set_enabled(!Is_flight_mode(proto::FLIGHT_MODE_WAYPOINTS));
-        c_guided->Set_enabled(status.control_mode != Sys_status::Control_mode::GUIDED);
+        c_guided->Set_enabled(current_control_mode != proto::CONTROL_MODE_CLICK_GO);
         c_land_command->Set_enabled();
         c_pause->Set_enabled(!Is_control_mode(proto::CONTROL_MODE_MANUAL) && !Is_flight_mode(proto::FLIGHT_MODE_HOLD));
         c_resume->Set_enabled(Is_flight_mode(proto::FLIGHT_MODE_HOLD));
@@ -2035,7 +2035,7 @@ Px4_vehicle::Update_capability_states()
         c_resume->Set_enabled(false);
         c_rth->Set_enabled(false);
         c_takeoff_command->Set_enabled(Is_armed());
-        c_arm->Set_enabled(!Is_armed() && status.control_mode != Sys_status::Control_mode::AUTO);
+        c_arm->Set_enabled(!Is_armed() && current_control_mode != proto::CONTROL_MODE_AUTO);
     }
     Commit_to_ucs();
 }
@@ -2052,7 +2052,7 @@ void
 Px4_vehicle::Configure()
 {
     // TODO: Add PX4 configuration
-    auto props = ugcs::vsm::Properties::Get_instance().get();
+    auto props = Properties::Get_instance().get();
     camera_trigger_type = props->Get_int("vehicle.px4.camera_trigger_type");
     camera_servo_idx = props->Get_int("vehicle.px4.camera_servo_idx");
     camera_servo_pwm = props->Get_int("vehicle.px4.camera_servo_pwm");
@@ -2078,15 +2078,48 @@ Px4_vehicle::Configure()
         }
     }
 
-    telemetry_rates[ugcs::vsm::mavlink::ALTITUDE] = DEFAULT_TELEMETRY_RATE;
-    telemetry_rates[ugcs::vsm::mavlink::ATTITUDE] = DEFAULT_TELEMETRY_RATE;
-    telemetry_rates[ugcs::vsm::mavlink::GLOBAL_POSITION_INT] = DEFAULT_TELEMETRY_RATE;
-    telemetry_rates[ugcs::vsm::mavlink::POSITION_TARGET_GLOBAL_INT] = DEFAULT_TELEMETRY_RATE;
-    telemetry_rates[ugcs::vsm::mavlink::GPS_RAW_INT] = DEFAULT_TELEMETRY_RATE;
-    telemetry_rates[ugcs::vsm::mavlink::HOME_POSITION] = DEFAULT_TELEMETRY_RATE;
-    telemetry_rates[ugcs::vsm::mavlink::HEARTBEAT] = DEFAULT_TELEMETRY_RATE;
-    telemetry_rates[ugcs::vsm::mavlink::SYS_STATUS] = DEFAULT_TELEMETRY_RATE;
-    telemetry_rates[ugcs::vsm::mavlink::VFR_HUD] = DEFAULT_TELEMETRY_RATE;
+    if (props->Exists("vehicle.px4.mavlink_protocol_version")) {
+        auto value = props->Get("vehicle.px4.mavlink_protocol_version");
+        Trim(value);
+        if (value == "1") {
+            use_mavlink_2 = false;
+            LOG_INFO("Force mavlink v1");
+        } else if (value == "2") {
+            use_mavlink_2 = true;
+            LOG_INFO("Force mavlink v2");
+        } else if (value == "auto") {
+            use_mavlink_2.Disengage();
+        } else {
+            LOG_ERR("Invalid value '%s' for mavlink_protocol_version", value.c_str());
+        }
+    }
+
+    if (props->Exists("vehicle.px4.autoheading")) {
+        auto yes = props->Get("vehicle.px4.autoheading");
+        if (yes == "no") {
+            autoheading = false;
+        } else if (yes == "yes") {
+            autoheading = true;
+        } else {
+            LOG_ERR("Invalid value '%s' for autoheading", yes.c_str());
+        }
+
+        if (autoheading) {
+            VEHICLE_LOG_INF((*this), "Autoheading is on.");
+        } else {
+            VEHICLE_LOG_INF((*this), "Autoheading is off.");
+        }
+    }
+
+    telemetry_rates[mavlink::ALTITUDE] = DEFAULT_TELEMETRY_RATE;
+    telemetry_rates[mavlink::ATTITUDE] = DEFAULT_TELEMETRY_RATE;
+    telemetry_rates[mavlink::GLOBAL_POSITION_INT] = DEFAULT_TELEMETRY_RATE;
+    telemetry_rates[mavlink::POSITION_TARGET_GLOBAL_INT] = DEFAULT_TELEMETRY_RATE;
+    telemetry_rates[mavlink::GPS_RAW_INT] = DEFAULT_TELEMETRY_RATE;
+    telemetry_rates[mavlink::HOME_POSITION] = DEFAULT_TELEMETRY_RATE;
+    telemetry_rates[mavlink::HEARTBEAT] = DEFAULT_TELEMETRY_RATE;
+    telemetry_rates[mavlink::SYS_STATUS] = DEFAULT_TELEMETRY_RATE;
+    telemetry_rates[mavlink::VFR_HUD] = DEFAULT_TELEMETRY_RATE;
 
     for (auto it = props->begin("vehicle.px4.telemetry_rate", '.'); it != props->end(); it++)
     {

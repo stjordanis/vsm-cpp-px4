@@ -1,4 +1,4 @@
-// Copyright (c) 2017, Smart Projects Holdings Ltd
+// Copyright (c) 2018, Smart Projects Holdings Ltd
 // All rights reserved.
 // See LICENSE file for license details.
 
@@ -30,23 +30,29 @@ public:
     static constexpr int BATT_FS_RTH = 1;
     static constexpr int BATT_FS_LAND = 2;
 
+    static constexpr int YAWMODE_NEXT_WP = 1;
+    static constexpr int YAWMODE_WP_DEFINED = 0;
+
     template<typename... Args>
     Px4_vehicle(
-            ugcs::vsm::Mavlink_demuxer::System_id system_id,
-            ugcs::vsm::Mavlink_demuxer::Component_id component_id,
-            ugcs::vsm::mavlink::MAV_TYPE type,
-            ugcs::vsm::Io_stream::Ref stream,
-            ugcs::vsm::Optional<std::string> mission_dump_path,
-            Args &&... args) :
-            Mavlink_vehicle(
-                    system_id, component_id, type,
-                    ugcs::vsm::mavlink::MAV_AUTOPILOT::MAV_AUTOPILOT_PX4,
-                    Vehicle::Capabilities(),
-                    stream, mission_dump_path, std::forward<Args>(args)...),
-            vehicle_command(*this),
-            task_upload(*this)
+        ugcs::vsm::Mavlink_demuxer::System_id system_id,
+        ugcs::vsm::Mavlink_demuxer::Component_id component_id,
+        ugcs::vsm::mavlink::MAV_TYPE type,
+        ugcs::vsm::Io_stream::Ref stream,
+        ugcs::vsm::Optional<std::string> mission_dump_path,
+        Args &&... args) :
+        Mavlink_vehicle(
+            system_id,
+            component_id,
+            Vendor::PX4,
+            type,
+            stream,
+            mission_dump_path,
+            std::forward<Args>(args)...),
+        vehicle_command(*this),
+        task_upload(*this)
     {
-        autopilot_type = "px4";
+        Set_autopilot_type("px4");
         /* Consider this as uptime start. */
         recent_connect = std::chrono::steady_clock::now();
         Configure();
@@ -191,11 +197,6 @@ public:
         void
         Unregister_status_text();
 
-        /** Get the value of custom mode corresponding to AUTO mode of the
-         * current vehicle type. */
-        uint32_t
-        Get_custom_auto_mode();
-
         /** Get the value of custom mode corresponding to reasonable manual mode
          * of the current vehicle type. */
         uint32_t
@@ -238,7 +239,10 @@ public:
     /** Data related to task upload processing. */
     class Task_upload: public Px4_activity {
     public:
-        using Px4_activity::Px4_activity;
+        Task_upload(Px4_vehicle& px4_vehicle):
+            Px4_activity(px4_vehicle),
+            task_attributes(px4_vehicle.real_system_id, px4_vehicle.real_component_id)
+        {}
 
         /** Calls appropriate prepare action based on type. */
         void
@@ -424,9 +428,12 @@ public:
         /** Mission POI action must be added as it was cancelled by previous actions.*/
         bool restart_mission_poi = false;
 
-        float current_heading = 0.0;
+        float current_heading = 0;
 
         float heading_to_this_wp = 0.0;
+
+        // current speed in mission.
+        float current_speed = -1;
 
         ugcs::vsm::Optional<int> current_camera_mode;
 
@@ -610,6 +617,9 @@ private:
     // How many 0,0,0,0 rc_override messages to send to exit joystick mode.
     constexpr static size_t RC_OVERRIDE_END_COUNT = 15;
 
+    // Generate CHANGE_SPEED command only if new speed differs from current speed more than this.
+    constexpr static float CHANGE_SPEED_TRESHOLD = 0.1;
+
     bool is_airborne = false;
 
     // camera pitch and yaw starting positions
@@ -630,8 +640,18 @@ private:
     // true when VSM has understood which mavlink version the vehicle supports.
     bool protocol_version_detected = false;
 
+    // true if MAV_CMD_SET_MESSAGE_INTERVAL is supported.
+    bool set_message_interval_supported = false;
+
     // Current mission hash.
     uint32_t current_route_id;
+
+    // Force use of specific mavlink version.
+    ugcs::vsm::Optional<bool> use_mavlink_2;
+
+    /** by default autoheading is turned on */
+    bool autoheading = true;
+
 };
 
 #endif /* _PX4_VEHICLE_H_ */

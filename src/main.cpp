@@ -1,4 +1,4 @@
-// Copyright (c) 2017, Smart Projects Holdings Ltd
+// Copyright (c) 2018, Smart Projects Holdings Ltd
 // All rights reserved.
 // See LICENSE file for license details.
 
@@ -8,6 +8,8 @@
 #include <px4_vehicle_manager.h>
 #include <signal.h>
 #include <iostream>
+
+DEFINE_DEFAULT_VSM_NAME;
 
 bool terminate;
 

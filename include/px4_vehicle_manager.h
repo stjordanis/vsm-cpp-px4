@@ -1,4 +1,4 @@
-// Copyright (c) 2017, Smart Projects Holdings Ltd
+// Copyright (c) 2018, Smart Projects Holdings Ltd
 // All rights reserved.
 // See LICENSE file for license details.
 
@@ -26,9 +26,8 @@ private:
             ugcs::vsm::Io_stream::Ref stream,
             ugcs::vsm::Socket_address::Ptr,
             ugcs::vsm::Optional<std::string> mission_dump_path,
-            std::string serial_number,
-            std::string model_name,
-            bool id_overridden) override;
+            const std::string& serial_number,
+            const std::string& model_name) override;
 
     virtual void
     Register_detectors() override;

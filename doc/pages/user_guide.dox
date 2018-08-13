@@ -51,7 +51,7 @@ Supported vehicle types:
 - VTOL vehicles
 
 Supported PX4 firmware versions:
-- 1.6.5
+- 1.7
 
 @section mission_execution_specifics Mission execution specifics
 
@@ -59,7 +59,7 @@ Supported PX4 firmware versions:
 
 Flight plan element / action | Support | Notes
 -----------------------------|---------|---------
-Change speed    |  Yes | |
+Change speed    |  Yes | See section \ref speed_in_mission below.|
 Wait    |  Yes | |
 Panorama        |  No | | 
 Set camera mode |  Yes | |
@@ -67,13 +67,43 @@ Set camera by time | Yes |  |
 Set camera by distance | Yes |  |
 Set camera attitude | Yes | |
 Set POI | No | |
-Change heading | Yes | See note below for VTOL specifics. |
+Change heading | Yes | See section \ref set_heading below. |
 
-@note Change yaw for VTOL vehicles works only when hovering over the waypoint. Vehicle will always fly with nose pointing to next waypoint.<br>
+
+@subsection speed_in_mission Vehicle speed in mission
+
+Vehicle speed in mission depends not only on the speed set for each waypoint but also on maximum climb and descent rates. 
+For best results make sure the "Max climb rate" and "Max descent rate" specified in 
+UgCS Vehicle Profile is equal to the rates configured on the vehicle: parameters MPC_Z_VEL_MAX_UP and MPC_Z_VEL_MAX_DN respectively.
+
+@warning PX4 will not always fly along the straight line between waypoints if waypoints are at different altitudes.
+
+The exact trajectory will depend on the slope angle, speed specified in mission and parameters MPC_Z_VEL_MAX_UP or MPC_Z_VEL_MAX_DN.
+Consider route consisting of 2 waypoints:
+- WP1 at altitude 30m, speed:1m/s
+- WP2 50m apart at altitude 20m.
+- MPC_Z_VEL_MAX_DN is set to 5m/s
+
+PX4 vehicle at WP1 will descend rapidly at 5m/s vertical speed while maintaining ~1m/s ground speed and then fly horizontally towards WP2.
+
+Workaround for the problem is to use "Safe" Trajectory type. In that case UGcS will generate only vertical and horizontal segments.
+
+@subsection set_heading Heading behavior
+
+Vehicle heading is controlled by "Heading" waypoint actions specified in route.
+If Heading is not specified for the route waypoint then VSM calculates the heading automatically to point to the next WP.<br>
+The above behavior can be disabled via @ref auto_heading parameter. In that case the vehicle behavior will depend on the autopilot parameter MIS_YAWMODE.<br>
+If MIS_YAWMODE is set to zero then heading WP action will make vehicle to change heading accordingly. For waypoints which do not have explicit heading action vehicle will keep the last heading.<br>
+If MIS_YAWMODE is set to non-zero then all heading actions in uploaded route will be ignored and vehicle will always point to the next WP by default.
+
+@subsubsection vtol_heading VTOL heading
+
+Change yaw for VTOL vehicles works only when hovering over the waypoint. Vehicle will always fly with nose pointing to next waypoint.<br>
 For Yaw action to succeed it must be used together with "Wait" action. 
 
-@subsection below_hl Flights below Home Location
 
+
+@subsection below_hl Flights below Home Location
 
 @warning PX4 does not support flying below Home Location. Make sure all route waypoints are above HL. See also @ref home_location.
 
@@ -170,6 +200,13 @@ Turn type          | Support  | Notes
 Straight           |  Yes     | The vehicle will fly a straight line to the location specified as a lat, lon and altitude. |
 Spline             |  No     | |
 
+@section yuneec Yuneec specific notes 
+
+Yuneec autopilot is based on PX4 but it lacks some features:
+- Failsafe settings on RC loss and battery low are not supported.
+- Speed setting during Click&Go is not supported.
+- Heading change during Click&Go is not supported.
+
 @section simulator_connection Connection to PX4 simulator
 
 PX4 VSM can be configured to connect to PX4 simulator via UDP connection on port 14550.
@@ -190,7 +227,6 @@ called XBee Connector. Please refer to XBee Connector user guide for details.
 
 In order to use such kind of connection you are to disable
 @ref serial_port_parameters and enable @ref proxy_parameters.
-
 
 @section config_file_parameters_section Configuration file
 
@@ -292,5 +328,36 @@ It is possible to configure rate for each message type separately.
         vehicle.px4.telemetry_rate.HOME_POSITION = 0.5
         vehicle.px4.telemetry_rate.SYS_STATUS = 0.5
         vehicle.px4.telemetry_rate.VFR_HUD = 0.5
+
+@subsection mavlink_version Mavlink version
+
+PX4 VSM supports MAVLink versions 1 and 2 and detects the correct version automatically. In setups when
+there is some intermediate device between VSM and autopilot this detection can fail.
+For those scenarios it is possible to force mavlink version used by VSM.
+
+- @b Required: No.
+- @b Supported @b values: 1 2 auto
+- @b Default: auto
+- @b Description: 1: always use mavlink version 1, 2: always use mavlink version 2, auto: Autodetect mavlink version.
+
+- @b Example:
+
+        vehicle.px4.mavlink_protocol_version = 1
+
+@subsection auto_heading Force heading to next WP
+
+By default VSM will automatically generate commands for vehicle to set heading towards next waypoint.
+This behavior can be disabled by setting parameter "autoheading" to no. See also @ref set_heading
+- @b Required: No.
+- @b Supported @b values: yes, no
+- @b Default: yes
+- @b Description:<br>
+    no - do not change heading between waypoints. This disables override of parameter MIS_YAWMODE on mission upload.
+    Vehicle heading will depend on MIS_YAWMODE. If MIS_YAWMODE is set to 1 (next WP) then all heading actions in mission will be ignored.<br>
+    yes - change heading towards next waypoint. When set, each mission upload sets MIS_YAWMODE to zero (yaw controlled by mission)
+
+- @b Example:
+
+        vehicle.px4.autoheading = no
 
 */
