@@ -38,7 +38,7 @@ public:
         ugcs::vsm::Mavlink_demuxer::System_id system_id,
         ugcs::vsm::Mavlink_demuxer::Component_id component_id,
         ugcs::vsm::mavlink::MAV_TYPE type,
-        ugcs::vsm::Io_stream::Ref stream,
+        ugcs::vsm::Mavlink_stream::Ptr stream,
         ugcs::vsm::Optional<std::string> mission_dump_path,
         Args &&... args) :
         Mavlink_vehicle(
@@ -55,8 +55,9 @@ public:
         Set_autopilot_type("px4");
         /* Consider this as uptime start. */
         recent_connect = std::chrono::steady_clock::now();
-        Configure();
     }
+
+    Px4_vehicle(ugcs::vsm::proto::Vehicle_type type);
 
     virtual void
     On_enable();
@@ -64,44 +65,12 @@ public:
     virtual void
     On_disable();
 
-    /** Distinguishable type of PX4 vehicle. This is mainly driven by
-     * PX4 firmware flavors each having some minor differences. */
-    enum Type {
-        /** Copter (quad, octa, hexa etc). */
-        COPTER,
-        /** Fixed wing plane. */
-        PLANE,
-        /** Rovers, cars. */
-        ROVER,
-        /** Other unsupported/unknown vehicle type, depending on the context.*/
-        OTHER
-    };
-
     /** UCS has sent a task for a vehicle. */
     virtual void
     Handle_vehicle_request(ugcs::vsm::Vehicle_task_request::Handle request) override;
 
-    /**
-     * UCS requesting command execution on a vehicle.
-     */
     virtual void
-    Handle_vehicle_request(ugcs::vsm::Vehicle_command_request::Handle request) override;
-
-    bool
-    Default_mavlink_handler(
-        ugcs::vsm::Io_buffer::Ptr,
-        ugcs::vsm::mavlink::MESSAGE_ID_TYPE message_id,
-        uint8_t system_id,
-        uint8_t component_id,
-        uint8_t);
-
-    /** Get the Type of the vehicle. */
-    Type
-    Get_type() const;
-
-    /** Get the Type of the vehicle based on Mavlink type. */
-    static Type
-    Get_type(ugcs::vsm::mavlink::MAV_TYPE);
+    Handle_ucs_command(ugcs::vsm::Ucs_request::Ptr ucs_request);
 
     /** PX4 specific activity. */
     class Px4_activity : public Activity {
@@ -135,6 +104,15 @@ public:
 
     void
     On_mission_item(ugcs::vsm::mavlink::Pld_mission_item mi);
+
+    // This handler is disabling the respective message.
+    template<ugcs::vsm::mavlink::MESSAGE_ID_TYPE id>
+    void
+    Disable_message_on_receive(typename ugcs::vsm::mavlink::Message<id>::Ptr) {
+        if (set_message_interval_supported) {
+            Set_message_interval(id, -1);
+        }
+    }
 
     void
     On_mission_downloaded(bool, std::string);
@@ -179,7 +157,7 @@ public:
 
         /** Enable class and start command execution. */
         void
-        Enable(ugcs::vsm::Vehicle_command_request::Handle vehicle_command_request);
+        Enable();
 
         /** Disable this class and cancel any existing request. */
         virtual void
@@ -211,6 +189,58 @@ public:
         void
         Set_mode(uint8_t main_mode = 0, uint8_t sub_mode = 0);
 
+        void
+        Process_guided();
+
+        void
+        Process_joystick();
+
+        void
+        Process_takeoff();
+
+        void
+        Process_auto();
+
+        void
+        Process_manual();
+
+        void
+        Process_arm();
+
+        void
+        Process_disarm();
+
+        void
+        Process_emergency_land();
+
+        void
+        Process_pause();
+
+        void
+        Process_resume();
+
+        // throws if a parameter is missing.
+        void
+        Process_waypoint(const ugcs::vsm::Property_list& params);
+
+        // throws if a parameter is missing.
+        void
+        Process_direct_payload_control(const ugcs::vsm::Property_list& params);
+
+        // throws if a parameter is missing.
+        void
+        Process_direct_vehicle_control(const ugcs::vsm::Property_list& params);
+
+        void
+        Process_land();
+
+        void
+        Process_rth();
+
+        // throws if a parameter is invalid (not float).
+        void
+        Process_set_poi(const ugcs::vsm::Property_list& params);
+
         /** Add MAVLink "Do reposition" command */
         void
         Do_reposition(
@@ -219,9 +249,6 @@ public:
             float altitude = NAN,
             float heading = NAN,
             float speed = 1.0f);
-
-        /** Current command request. */
-        ugcs::vsm::Vehicle_command_request::Handle vehicle_command_request;
 
         /** Mavlink messages to be sent to execute current command. */
         std::list<ugcs::vsm::mavlink::Payload_base::Ptr> cmd_messages;
@@ -234,6 +261,8 @@ public:
 
         /** Current timeout to use when scheduling timer. */
         std::chrono::milliseconds current_timeout;
+
+        float command_count = 0; // for progress reporting
     } vehicle_command;
 
     /** Data related to task upload processing. */
@@ -405,7 +434,7 @@ public:
          * requirements. Example is adding of magical "dummy waypoints" and
          * special processing of waypoint zero.
          */
-        std::vector<ugcs::vsm::mavlink::Payload_base::Ptr> prepared_actions;
+        ugcs::vsm::mavlink::Payload_list prepared_actions;
 
         /** Task attributes to be written to the vehicle. */
         Write_parameters::List task_attributes;
@@ -524,28 +553,55 @@ private:
 
     /** Load parameters from configuration. */
     void
-    Configure();
+    Configure_common();
+
+    void
+    Configure_real_vehicle();
 
     bool
     Is_home_position_valid();
 
-    void
-    Start_rc_override();
+    /** Direct vehicle control functionality */
 
     void
-    Send_rc_override();
+    Start_direct_vehicle_control();
+
+    void
+    Stop_direct_vehicle_control();
 
     bool
-    Send_rc_override_timer();
-
-    bool
-    Is_rc_override_active();
+    Direct_vehicle_control_timer();
 
     void
-    Stop_rc_override();
+    Send_direct_vehicle_control();
 
     void
-    Set_rc_override(int p, int r, int t, int y);
+    Set_direct_vehicle_control(int p, int r, int t, int y);
+
+    // MANUAL_CONTROL message which holds the latest joystick values.
+    // Existence of this messages means that vehicle is in joystick mode.
+    ugcs::vsm::mavlink::Pld_manual_control::Ptr direct_vehicle_control = nullptr;
+
+    // Last time we sent the MANUAL_CONTROL message. Used to limit rate at which
+    // the joystick commands are sent to vehicle.
+    std::chrono::time_point<std::chrono::steady_clock> direct_vehicle_control_last_sent;
+
+    // Last time we received joystick message from ucs. Used to fail over to
+    // manual mode automatically if no messages received for MANUAL_CONTROL_TIMEOUT.
+    std::chrono::time_point<std::chrono::steady_clock> direct_vehicle_control_last_received;
+
+    // Timeout when to revert back to manual mode if no joystick messages
+    // received from ucs.
+    constexpr static std::chrono::milliseconds MANUAL_CONTROL_TIMEOUT {3000};
+
+    // Timeout when to revert back to manual mode if no joystick messages
+    // received from ucs.
+    constexpr static std::chrono::milliseconds MANUAL_CONTROL_PERIOD {200};
+
+    // Timer instance for sending MANUAL_CONTROL messages.
+    ugcs::vsm::Timer_processor::Timer::Ptr direct_vehicle_control_timer = nullptr;
+
+    /** End direct vehicle control functionality */
 
     /**
      * Minimal waypoint acceptance radius to use.
@@ -586,38 +642,7 @@ private:
 
     ugcs::vsm::Geodetic_tuple home_location {0, 0, 0};
 
-    /** Joystick mode support */
-
-    // Timer instance for sending rc_override messages.
-    ugcs::vsm::Timer_processor::Timer::Ptr rc_override_timer = nullptr;
-
-    // RC Override message which holds the latest joystick values.
-    // Existence of this messages means that vehicle is in joystick mode.
-    ugcs::vsm::mavlink::Pld_rc_channels_override::Ptr rc_override = nullptr;
-
-    // Last time we sent the rc_overrride message. Used to limit rate at which
-    // the joystick commands are sent to vehicle.
-    std::chrono::time_point<std::chrono::steady_clock> rc_override_last_sent;
-
-    // Last time we received joystick message from ucs. Used to fail over to
-    // manual mode automatically if no messages received for RC_OVERRIDE_TIMEOUT.
-    std::chrono::time_point<std::chrono::steady_clock> direct_vehicle_control_last_received;
-
-    // Timeout when to revert back to manual mode if no joystick messages
-    // received from ucs.
-    constexpr static std::chrono::milliseconds RC_OVERRIDE_TIMEOUT {3000};
-
-    // Counter which governs the end of Joystick mode. To ensure PX4
-    // exits rc_override we need to spam 0,0,0,0 messages.
-    size_t rc_override_end_counter = 0;
-
-    // How frequently to send the rc_overrride messages to vehicle.
-    constexpr static std::chrono::milliseconds RC_OVERRIDE_PERIOD {200};
-
-    // How many 0,0,0,0 rc_override messages to send to exit joystick mode.
-    constexpr static size_t RC_OVERRIDE_END_COUNT = 15;
-
-    // Generate CHANGE_SPEED command only if new speed differs from current speed more than this.
+    // Generate CHANGE_SPEED command in mission only if new speed differs from current speed more than this.
     constexpr static float CHANGE_SPEED_TRESHOLD = 0.1;
 
     bool is_airborne = false;
@@ -643,6 +668,9 @@ private:
     // true if MAV_CMD_SET_MESSAGE_INTERVAL is supported.
     bool set_message_interval_supported = false;
 
+    // true if MAV_CMD_DO_SET_ROI_LOCATION is supported.
+    bool set_poi_supported = false;
+
     // Current mission hash.
     uint32_t current_route_id;
 
@@ -651,7 +679,6 @@ private:
 
     /** by default autoheading is turned on */
     bool autoheading = true;
-
 };
 
 #endif /* _PX4_VEHICLE_H_ */

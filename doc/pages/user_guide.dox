@@ -2,10 +2,6 @@
 
 @page vsm_user_guide Connecting PX4 autopilot to UgCS
 
-@image latex ugcs-logo.png "" width=3cm
-@image latex main-vsm-logo.png "" width=3cm
-
-
 @section first_time_connection First time vehicle connection
 
 See @ref vsm_disclaimer.
@@ -51,7 +47,7 @@ Supported vehicle types:
 - VTOL vehicles
 
 Supported PX4 firmware versions:
-- 1.7
+- 1.7+
 
 @section mission_execution_specifics Mission execution specifics
 
@@ -66,7 +62,7 @@ Set camera mode |  Yes | |
 Set camera by time | Yes |  |
 Set camera by distance | Yes |  |
 Set camera attitude | Yes | |
-Set POI | No | |
+Set POI | Yes | Starting from PX4 version 1.8 |
 Change heading | Yes | See section \ref set_heading below. |
 
 
@@ -148,7 +144,7 @@ DISARM         |  Yes     | Disarms vehicle. |
 AUTOMODE       |  Yes     | Start mission from first waypoint. Sets vehicle into _Mission_ flight mode. |
 MANUALMODE     |  Yes     | Sets _Manual_ mode. |
 CLICK & GO     |  Yes     | Sets _Click & Go_ (single waypoint) mode. |
-JOYSTICK       |  No      | |
+JOYSTICK       |  No      | Vehicle control via joystick. |
 HOLD           |  Yes     | Pause mission execution. The drone will loiter at its current position. |
 CONTINUE       |  Yes     | Continue with mission execution from next waypoint. Works from _Manual_ and _Click&Go_ modes.|
 RETURN HOME    |  Yes     | Vehicle will return to home location. See also @ref home_location. |
@@ -156,6 +152,21 @@ TAKEOFF        |  Yes     | |
 LAND           |  Yes     | |
 EMERGENCYLAND  |  Yes     | |
 CAMERA_TRIGGER |  No      | |
+DRIECT_PAYLOAD_CONTROL |  Yes     | Payload control via keyboard/joystick. |
+
+@section autopilot_variables Autopilot parameters
+
+There is a number of MAVlink parameters which are changed on the autopilot during operation.
+Parameters are set during route upload and command execution.
+
+Parameter | Description
+---|---
+COM_LOW_BAT_ACT | Modified if route parameters sets failsafe action on low battery. 
+MIS_YAWMODE     | Set to 0 on route upload if "autoheading" is set to yes. See also @ref auto_heading
+MPC_XY_CRUISE   | Modified when Click&Go command issued on the vehicle.
+MPC_XY_VEL_MAX  | Modified when Click&Go command issued and specified speed exceeds current value of MPC_XY_VEL_MAX.
+NAV_RCL_ACT     | Modified if route parameters sets failsafe action on RC signal loss.
+RTL_RETURN_ALT  | Modified if route parameters sets Emergency return altitude.
 
 @section commands_shading Command shading
 
@@ -283,7 +294,7 @@ be visible to the UgCS.
         vehicle.px4.custom.my_drone.model_name = PX4Quad
         vehicle.px4.custom.my_drone.serial_number = 123456
 
-@subsection camera_trigger_type parameter
+@subsection camera_trigger_type Camera trigger type
 
 There are different ways to control camera payload in px4 family. First one is
 "common" one and utilizes SET_SERVO or REPEAT_SERVO commands. Camera trigger control
@@ -359,5 +370,30 @@ This behavior can be disabled by setting parameter "autoheading" to no. See also
 - @b Example:
 
         vehicle.px4.autoheading = no
+
+@subsection mavlink_injection Mavlink message injection
+
+Ardupilot VSM can receive mavlink packets and forward them to the vehicle if vehicle with specified target_id is connected. It can be used to send GPS RTK corrections to vehicles.
+If message has no target_id or traget_id is 0 then it is sent to all connected vehicles.
+Supported messages are: COMMAND_LONG, COMMAND_INT, GPS_INJECT_DATA and GPS_RTCM_DATA. 
+The prefix mavlink_injection supports all the same syntax as "connection" prefix.
+
+- @b Required: No.
+- @b Supported @b values: Same as those for connection prefix.
+- @b Default: Not set.
+- @b Example:
+
+        mavlink_injection.udp_any.1.local_port = 44444
+
+@subsection mavlink_sysid Mavlink System ID
+
+MAVlink System ID used for outgoing MAVlink messages.
+
+- @b Required: No.
+- @b Supported @b values: 1 - 254
+- @b Default: 1.
+- @b Example:
+
+        mavlink.vsm_system_id = 100
 
 */

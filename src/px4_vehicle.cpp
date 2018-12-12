@@ -4,19 +4,45 @@
 
 #include <px4_vehicle.h>
 
-constexpr std::chrono::milliseconds Px4_vehicle::RC_OVERRIDE_PERIOD;
-constexpr std::chrono::milliseconds Px4_vehicle::RC_OVERRIDE_TIMEOUT;
-
 constexpr float Px4_vehicle::MAX_COPTER_SPEED;
 
 using namespace ugcs::vsm;
 
-const Mavlink_demuxer::System_id Mavlink_vehicle::VSM_SYSTEM_ID = 255;
-const Mavlink_demuxer::Component_id Mavlink_vehicle::VSM_COMPONENT_ID = 0;
+constexpr std::chrono::milliseconds Px4_vehicle::MANUAL_CONTROL_PERIOD;
+constexpr std::chrono::milliseconds Px4_vehicle::MANUAL_CONTROL_TIMEOUT;
+
+// Constructor for command processor.
+Px4_vehicle::Px4_vehicle(proto::Vehicle_type type):
+        Mavlink_vehicle(Vendor::PX4, "px4", type),
+        vehicle_command(*this),
+        task_upload(*this),
+        set_poi_supported(true)
+{
+    switch (type) {
+    case proto::VEHICLE_TYPE_HELICOPTER:
+    case proto::VEHICLE_TYPE_MULTICOPTER:
+        Set_model_name("PX4Copter");
+        break;
+    default:
+        VSM_EXCEPTION(Internal_error_exception, "unsupported type");
+    }
+}
 
 void
 Px4_vehicle::On_enable()
 {
+    Configure_common();
+
+    if (device_type == proto::DEVICE_TYPE_VEHICLE_COMMAND_PROCESSOR) {
+        // Do not need any other initialization for command_processor.
+        // Just register it with UCS.
+        Register();
+        // Send command availability.
+        Commit_to_ucs();
+        return;
+    }
+
+    Configure_real_vehicle();
     // Get parameter values.
     Mavlink_vehicle::On_enable();
 
@@ -35,22 +61,14 @@ Px4_vehicle::On_enable()
     c_takeoff_command->Set_available();
     c_direct_payload_control->Set_available();
     c_payload_control->Set_available();
-
-    Set_rc_loss_actions({
-        proto::FAILSAFE_ACTION_RTH,
-        proto::FAILSAFE_ACTION_CONTINUE,
-        proto::FAILSAFE_ACTION_WAIT,
-        proto::FAILSAFE_ACTION_LAND
-        });
-
-    Set_low_battery_actions({
-        proto::FAILSAFE_ACTION_RTH,
-        proto::FAILSAFE_ACTION_CONTINUE,
-        proto::FAILSAFE_ACTION_LAND
-        });
+    c_joystick->Set_available();
+    c_direct_payload_control->Set_enabled(true);
 
     c_transition_fixed = flight_controller->Add_command("transition_fixed", true);
     c_transition_vtol = flight_controller->Add_command("transition_vtol", true);
+
+    c_set_poi->Set_available();
+    c_set_poi->Set_enabled();
 
     Commit_to_ucs();    // push state info.
 
@@ -67,51 +85,47 @@ Px4_vehicle::On_enable()
             &Px4_vehicle::On_mission_downloaded,
             Shared_from_this()));
 
-    // This handles disables unneeded messages upon receive.
-    mav_stream->Get_demuxer().Register_default_handler(
-        Mavlink_demuxer::Make_default_handler(
-                    &Px4_vehicle::Default_mavlink_handler,
-                    Shared_from_this()));
+    // Register handlers for messages which should be disabled.
+    // Cannot do this in Default handler because mav_stream can be shared by multiple vehicles.
+    #define REG_DISABLER(x) \
+    common_handlers.Register_mavlink_handler<mavlink::x>(&Px4_vehicle::Disable_message_on_receive<mavlink::x>, this)
+
+    REG_DISABLER(HIGHRES_IMU);
+    REG_DISABLER(ATTITUDE_TARGET);
+    REG_DISABLER(ATTITUDE_QUATERNION);
+    REG_DISABLER(ACTUATOR_CONTROL_TARGET);
+    REG_DISABLER(GPS_RAW_INT);
+    REG_DISABLER(TIMESYNC);
+    REG_DISABLER(POSITION_TARGET_LOCAL_NED);
+    REG_DISABLER(SERVO_OUTPUT_RAW);
+    REG_DISABLER(WIND_COV);
+    REG_DISABLER(VIBRATION);
 
     // Home location handler.
-    mav_stream->Get_demuxer().
-            Register_handler<mavlink::MESSAGE_ID::HOME_POSITION, mavlink::Extension>(
-            Mavlink_demuxer::Make_handler<mavlink::MESSAGE_ID::HOME_POSITION, mavlink::Extension>(
-                    &Px4_vehicle::On_home_position,
-                    Shared_from_this()));
+    common_handlers.Register_mavlink_handler<mavlink::MESSAGE_ID::HOME_POSITION>(
+        &Px4_vehicle::On_home_position,
+        this);
 
     // To detect takeoff.
-    mav_stream->Get_demuxer().
-            Register_handler<mavlink::MESSAGE_ID::EXTENDED_SYS_STATE, mavlink::Extension>(
-            Mavlink_demuxer::Make_handler<mavlink::MESSAGE_ID::EXTENDED_SYS_STATE, mavlink::Extension>(
-                    &Px4_vehicle::On_extended_sys_state,
-                    Shared_from_this()));
+    common_handlers.Register_mavlink_handler<mavlink::MESSAGE_ID::EXTENDED_SYS_STATE>(
+        &Px4_vehicle::On_extended_sys_state,
+        this);
 
-    mav_stream->Get_demuxer().
-            Register_handler<mavlink::MESSAGE_ID::AUTOPILOT_VERSION, mavlink::Extension>(
-            Mavlink_demuxer::Make_handler<mavlink::MESSAGE_ID::AUTOPILOT_VERSION, mavlink::Extension>(
-                    &Px4_vehicle::On_autopilot_version,
-                    Shared_from_this()));
+    common_handlers.Register_mavlink_handler<mavlink::MESSAGE_ID::AUTOPILOT_VERSION>(
+        &Px4_vehicle::On_autopilot_version,
+        this);
 
+    common_handlers.Register_mavlink_handler<mavlink::MESSAGE_ID::CAMERA_INFORMATION>(
+        &Px4_vehicle::On_camera_information,
+        this);
 
-    mav_stream->Get_demuxer().
-            Register_handler<mavlink::MESSAGE_ID::CAMERA_INFORMATION, mavlink::Extension>(
-            Mavlink_demuxer::Make_handler<mavlink::MESSAGE_ID::CAMERA_INFORMATION, mavlink::Extension>(
-                    &Px4_vehicle::On_camera_information,
-                    Shared_from_this()));
+    common_handlers.Register_mavlink_handler<mavlink::MESSAGE_ID::CAMERA_IMAGE_CAPTURED>(
+        &Px4_vehicle::On_image_captured,
+        this);
 
-    mav_stream->Get_demuxer().
-            Register_handler<mavlink::MESSAGE_ID::CAMERA_IMAGE_CAPTURED, mavlink::Extension>(
-            Mavlink_demuxer::Make_handler<mavlink::MESSAGE_ID::CAMERA_IMAGE_CAPTURED, mavlink::Extension>(
-                    &Px4_vehicle::On_image_captured,
-                    Shared_from_this()));
-
-    mav_stream->Get_demuxer().
-            Register_handler<mavlink::MESSAGE_ID::PARAM_VALUE, mavlink::Extension>(
-            Mavlink_demuxer::Make_handler<mavlink::MESSAGE_ID::PARAM_VALUE, mavlink::Extension>(
-            &Px4_vehicle::On_parameter,
-            Shared_from_this()),
-            real_system_id);
+    common_handlers.Register_mavlink_handler<mavlink::MESSAGE_ID::PARAM_VALUE>(
+        &Px4_vehicle::On_parameter,
+        this);
 
     // Get autopilot version
     auto cmd_long = mavlink::Pld_command_long::Create();
@@ -130,45 +144,16 @@ Px4_vehicle::On_enable()
     }
 }
 
-bool
-Px4_vehicle::Default_mavlink_handler(
-    Io_buffer::Ptr,
-    mavlink::MESSAGE_ID_TYPE message_id,
-    uint8_t,
-    uint8_t,
-    uint8_t)
-{
-    if (!set_message_interval_supported) {
-        return false;
-    }
-    // Turn off messages which we do not want to see any more.
-    static const std::unordered_set<int> msgs = {
-        mavlink::HIGHRES_IMU,
-        mavlink::LOCAL_POSITION_NED,
-        mavlink::ATTITUDE_TARGET,
-        mavlink::ATTITUDE_QUATERNION,
-        mavlink::ACTUATOR_CONTROL_TARGET,
-        mavlink::ESTIMATOR_STATUS,
-        mavlink::GPS_RAW_INT,
-        mavlink::TIMESYNC,
-        mavlink::POSITION_TARGET_LOCAL_NED,
-        mavlink::SERVO_OUTPUT_RAW,
-        mavlink::WIND_COV,
-        mavlink::VIBRATION
-    };
-    if (msgs.find(message_id) != msgs.end()) {
-        Set_message_interval(message_id, -1);
-        LOG("Disabling message %d", message_id);
-    }
-    return false;
-}
-
 void
 Px4_vehicle::On_disable()
 {
-    if (rc_override_timer) {
-        rc_override_timer->Cancel();
+    if (device_type == proto::DEVICE_TYPE_VEHICLE_COMMAND_PROCESSOR) {
+        return;
     }
+    if (direct_vehicle_control_timer) {
+        direct_vehicle_control_timer->Cancel();
+    }
+    read_waypoints.item_handler = Read_waypoints::Mission_item_handler();
     Mavlink_vehicle::On_disable();
 }
 
@@ -192,6 +177,10 @@ Px4_vehicle::On_autopilot_version(
 
     if (maj > 1 || (maj == 1 && min >= 4)) {
         set_message_interval_supported = true;
+    }
+
+    if (maj > 1 || (maj == 1 && min >= 8)) {
+        set_poi_supported = true;
     }
 
     if (!protocol_version_detected) {
@@ -379,46 +368,129 @@ Px4_vehicle::Handle_vehicle_request(Vehicle_task_request::Handle request)
     task_upload.Enable(request);
 }
 
-void // ?
-Px4_vehicle::Handle_vehicle_request(Vehicle_command_request::Handle request)
+void
+Px4_vehicle::Handle_ucs_command(
+    Ucs_request::Ptr ucs_request)
 {
-    ASSERT(!vehicle_command.vehicle_command_request);
-    vehicle_command.Disable();
-    vehicle_command.Enable(request);
+    if (vehicle_command.ucs_request) {
+        Command_failed(ucs_request, "Previous request in progress");
+        return;
+    }
+
+    if (ucs_request->request.device_commands_size() == 0) {
+        Command_failed(ucs_request, "No commands found", proto::STATUS_INVALID_COMMAND);
+        return;
+    }
+
+    try {
+        auto &vsm_cmd = ucs_request->request.device_commands(0);
+
+        auto cmd = Get_command(vsm_cmd.command_id());
+
+        if (cmd == c_mission_upload || cmd == c_get_native_route) {
+            VEHICLE_LOG_INF((*this), "COMMAND %s", Dump_command(vsm_cmd).c_str());
+            if ((cmd == c_mission_upload) && read_waypoints.In_progress()) {
+                Command_failed(ucs_request, "Mission download in progress");
+                return;
+            }
+            Vehicle::Handle_ucs_command(ucs_request);
+            return;
+        }
+
+        vehicle_command.Disable("Internal error");
+        vehicle_command.ucs_request = ucs_request;
+        vehicle_command.Enable();
+    } catch (const std::exception& ex) {
+        Command_failed(ucs_request, ex.what(), proto::STATUS_INVALID_PARAM);
+    }
 }
 
-Px4_vehicle::Type
-Px4_vehicle::Get_type() const
+void
+Px4_vehicle::Start_direct_vehicle_control()
 {
-    return Get_type(Get_mav_type());
+    if (direct_vehicle_control == nullptr) {
+        // Create rc_override message. timer will delete it when vehicle switched to other mode.
+        direct_vehicle_control = mavlink::Pld_manual_control::Create();
+        (*direct_vehicle_control)->target = real_system_id;
+
+        direct_vehicle_control_timer = Timer_processor::Get_instance()->Create_timer(
+            MANUAL_CONTROL_PERIOD,
+            Make_callback(&Px4_vehicle::Direct_vehicle_control_timer, Shared_from_this()),
+            Get_completion_ctx());
+    }
+    // Set larger timeout when turning on joystick mode
+    // to let client more time to understand that joystick commands must be sent, now.
+    direct_vehicle_control_last_received = std::chrono::steady_clock::now() + MANUAL_CONTROL_TIMEOUT;
+    Set_direct_vehicle_control(0, 0, 0, 0);
+    Send_direct_vehicle_control();
 }
 
-Px4_vehicle::Type
-Px4_vehicle::Get_type(mavlink::MAV_TYPE type)
+void
+Px4_vehicle::Stop_direct_vehicle_control()
 {
-    switch (type) {
-    case mavlink::MAV_TYPE::MAV_TYPE_QUADROTOR:
-    case mavlink::MAV_TYPE::MAV_TYPE_HEXAROTOR:
-    case mavlink::MAV_TYPE::MAV_TYPE_OCTOROTOR:
-    case mavlink::MAV_TYPE::MAV_TYPE_TRICOPTER:
-    case mavlink::MAV_TYPE::MAV_TYPE_HELICOPTER:
-    case mavlink::MAV_TYPE::MAV_TYPE_COAXIAL:
-    // Treat VTOL as copter, too.
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_DUOROTOR:
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_QUADROTOR:
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_RESERVED2:
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_RESERVED3:
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_RESERVED4:
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_RESERVED5:
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_TILTROTOR:
-        return Type::COPTER;
-    case mavlink::MAV_TYPE::MAV_TYPE_FIXED_WING:
-        return Type::PLANE;
-    case mavlink::MAV_TYPE::MAV_TYPE_GROUND_ROVER:
-        return Type::ROVER;
-    default:
-        return Type::OTHER;
-        break;
+    Set_direct_vehicle_control(0, 0, 0, 0);
+    Send_direct_vehicle_control();
+    direct_vehicle_control = nullptr;
+}
+
+bool
+Px4_vehicle::Direct_vehicle_control_timer()
+{
+    if (direct_vehicle_control == nullptr) {
+        return false;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+
+    if (now - direct_vehicle_control_last_received > MANUAL_CONTROL_TIMEOUT) {
+        // Automatically exit joystick mode if there are no control messages from ucs.
+        Stop_direct_vehicle_control();
+        return false;
+    }
+
+    if (now - direct_vehicle_control_last_sent < MANUAL_CONTROL_PERIOD) {
+        // Do not spam radio link too much.
+        return true;
+    }
+
+    Send_direct_vehicle_control();
+
+    return true;
+}
+
+void
+Px4_vehicle::Set_direct_vehicle_control(int p, int r, int t, int y)
+{
+    if (direct_vehicle_control) {
+        (*direct_vehicle_control)->x = p;
+        (*direct_vehicle_control)->y = r;
+        (*direct_vehicle_control)->z = t;
+        (*direct_vehicle_control)->r = y;
+    }
+}
+
+void
+Px4_vehicle::Send_direct_vehicle_control()
+{
+    if (direct_vehicle_control) {
+//        LOG("Direct vehicle %d %d %d %d",
+//            (*direct_vehicle_control)->x.Get(),
+//            (*direct_vehicle_control)->y.Get(),
+//            (*direct_vehicle_control)->z.Get(),
+//            (*direct_vehicle_control)->r.Get()
+//            );
+        mav_stream->Send_message(
+                *direct_vehicle_control,
+                255,
+                190,
+                Mavlink_vehicle::WRITE_TIMEOUT,
+                Make_timeout_callback(
+                        &Mavlink_vehicle::Write_to_vehicle_timed_out,
+                        Shared_from_this(),
+                        mav_stream),
+                Get_completion_ctx());
+
+        direct_vehicle_control_last_sent = std::chrono::steady_clock::now();
     }
 }
 
@@ -467,313 +539,255 @@ Px4_vehicle::Vehicle_command_act::Do_reposition(
     cmd_messages.emplace_back(cmd_long);
 }
 
+void
+Px4_vehicle::Vehicle_command_act::Process_arm()
+{
+    if (!vehicle.Is_armed() && vehicle.Is_control_mode(proto::CONTROL_MODE_AUTO)) {
+        Disable("Arming disabled while in AUTO mode");
+        return;
+    }
+
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_COMPONENT_ARM_DISARM;
+    (*cmd_long)->param1 = 1;    // arm
+    (*cmd_long)->confirmation = 0;
+    cmd_messages.emplace_back(cmd_long);
+    Register_status_text();
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_disarm()
+{
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_COMPONENT_ARM_DISARM;
+    (*cmd_long)->param1 = 0;    // disarm
+    (*cmd_long)->confirmation = 0;
+    cmd_messages.emplace_back(cmd_long);
+    Register_status_text();
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_emergency_land()
+{
+    Process_disarm();
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_takeoff()
+{
+    Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_TAKEOFF));
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_rth()
+{
+    Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_RTL));
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_land()
+{
+    Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_LAND));
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_guided()
+{
+    if (!px4_vehicle.is_airborne) {
+        Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_TAKEOFF));
+    }
+    Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_LOITER));
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_joystick()
+{
+    Set_mode(static_cast<uint8_t>(Px4_main_mode::POSCTL));
+    px4_vehicle.Start_direct_vehicle_control();
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_auto()
+{
+    auto set_current = mavlink::Pld_mission_set_current::Create();
+    Fill_target_ids(*set_current);
+    (*set_current)->seq = 0;
+    cmd_messages.emplace_back(set_current);
+    if (!px4_vehicle.is_airborne) {
+        Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_TAKEOFF));
+    }
+    Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_MISSION));
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_manual()
+{
+    px4_vehicle.Stop_direct_vehicle_control();
+    Set_mode(static_cast<uint8_t>(Px4_main_mode::POSCTL));
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_pause()
+{
+    px4_vehicle.Stop_direct_vehicle_control();
+    Do_reposition();
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_resume()
+{
+    px4_vehicle.Stop_direct_vehicle_control();
+    Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_MISSION));
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_waypoint(const Property_list& params)
+{
+    if (px4_vehicle.Is_home_position_valid()) {
+        float speed, alt, hdg, ao;
+        double lat, lon;
+        params.at("ground_speed")->Get_value(speed);
+        params.at("latitude")->Get_value(lat);
+        params.at("longitude")->Get_value(lon);
+        params.at("altitude_amsl")->Get_value(alt);
+        params.at("altitude_origin")->Get_value(ao);
+        params.at("heading")->Get_value(hdg);
+        if (!px4_vehicle.is_airborne) {
+            Set_mode(
+                static_cast<uint8_t>(Px4_main_mode::AUTO),
+                static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_TAKEOFF));
+        }
+        if (!vehicle.Is_control_mode(proto::CONTROL_MODE_CLICK_GO)) {
+            Set_mode(
+                static_cast<uint8_t>(Px4_main_mode::AUTO),
+                static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_LOITER));
+        }
+
+        if (px4_vehicle.vendor == Px4_vendor::YUNEEC) {
+            VEHICLE_LOG_WRN(vehicle, "Ignoring speed setting as MPC_XY_CRUISE is not supported by Yuneec.");
+        } else {
+            auto param = mavlink::Pld_param_set::Create();
+            Fill_target_ids(*param);
+            (*param)->param_id = "MPC_XY_CRUISE";
+            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
+            (*param)->param_value = speed;
+            cmd_messages.emplace_back(param);
+
+            if (px4_vehicle.max_ground_speed < speed) {
+                auto param = mavlink::Pld_param_set::Create();
+                Fill_target_ids(*param);
+                (*param)->param_id = "MPC_XY_VEL_MAX";
+                (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
+                (*param)->param_value = speed;
+                cmd_messages.emplace_back(param);
+            }
+        }
+
+        Do_reposition(
+            lat,
+            lon,
+            // Convert to vehicle global frame. TODO: rework after altitude calibration feature.
+            px4_vehicle.home_location.altitude + alt - ao,
+            hdg,
+            speed);
+    } else {
+        Disable("Invalid home position");
+    }
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_set_poi(const Property_list& params)
+{
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    bool active = false;
+    params.at("active")->Get_value(active);
+    if (active) {
+        double latitude;
+        double longitude;
+        float altitude_amsl;
+        params.at("altitude_amsl")->Get_value(altitude_amsl);
+        params.at("latitude")->Get_value(latitude);
+        params.at("longitude")->Get_value(longitude);
+        (*cmd_long)->param5 = latitude * 180.0 / M_PI;
+        (*cmd_long)->param6 = longitude * 180.0 / M_PI;
+        (*cmd_long)->param7 = altitude_amsl;
+    } else {
+        (*cmd_long)->param5 = 0;
+        (*cmd_long)->param6 = 0;
+        (*cmd_long)->param7 = 0;
+    }
+    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_ROI;
+    (*cmd_long)->param1 = mavlink::MAV_ROI_LOCATION;
+    cmd_messages.emplace_back(cmd_long);
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_direct_payload_control(const Property_list& params)
+{
+    float pitch, yaw;
+    params.at("pitch")->Get_value(pitch);
+    params.at("yaw")->Get_value(yaw);
+    //LOG("Direct payload (py) %1.3f %1.3f", pitch, yaw);
+
+    px4_vehicle.payload_pitch += pitch * DIRECT_PAYLOAD_CONTROLLING_COEF;
+    px4_vehicle.payload_yaw += yaw * DIRECT_PAYLOAD_CONTROLLING_COEF;
+
+    if (px4_vehicle.payload_pitch > 0) {px4_vehicle.payload_pitch = 0;}
+    if (px4_vehicle.payload_pitch < -90) {px4_vehicle.payload_pitch = -90;}
+    if (px4_vehicle.payload_yaw > 180) {px4_vehicle.payload_yaw -= 360;}
+    if (px4_vehicle.payload_yaw < -180) {px4_vehicle.payload_yaw += 360;}
+
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_DO_MOUNT_CONTROL;
+    (*cmd_long)->param1 = px4_vehicle.payload_pitch;
+    (*cmd_long)->param2 = 0;
+    (*cmd_long)->param3 = px4_vehicle.payload_yaw;
+    (*cmd_long)->param7 = mavlink::MAV_MOUNT_MODE::MAV_MOUNT_MODE_MAVLINK_TARGETING;
+    cmd_messages.emplace_back(cmd_long);
+}
+
+void
+Px4_vehicle::Vehicle_command_act::Process_direct_vehicle_control(const Property_list& params)
+{
+    float pitch, yaw, roll, throttle;
+    params.at("pitch")->Get_value(pitch);
+    params.at("yaw")->Get_value(yaw);
+    params.at("roll")->Get_value(roll);
+    params.at("throttle")->Get_value(throttle);
+
+//    LOG("Direct Vehicle (rpyt) %1.3f %1.3f %1.3f %1.3f",
+//        roll,
+//        pitch,
+//        yaw,
+//        throttle);
+
+    px4_vehicle.Set_direct_vehicle_control(pitch * 1000, roll * 1000, throttle * 1000, yaw * 1000);
+    px4_vehicle.direct_vehicle_control_last_received = std::chrono::steady_clock::now();
+}
+
 bool
 Px4_vehicle::Vehicle_command_act::Try()
 {
     if (!remaining_attempts--) {
         VEHICLE_LOG_WRN(vehicle, "Vehicle_command all attempts failed.");
-        Disable();
+        Disable("Vehicle_command all attempts failed.");
         return false;
     }
 
-    current_timeout = retry_timeout;
-
-    int current_control_mode;
-    vehicle.t_control_mode->Get_value(current_control_mode);
-
-    cmd_messages.clear();
-
-    const auto request_type = vehicle_command_request->Get_type();
-
-    switch (request_type) {
-    case Vehicle_command::Type::ARM:
-        if (!vehicle.Is_armed() && current_control_mode == proto::CONTROL_MODE_AUTO) {
-            vehicle_command_request.Fail("Arming disabled while in AUTO mode");
-            break;
-        }
-        // no break
-    case Vehicle_command::Type::EMERGENCY_LAND:
-    case Vehicle_command::Type::DISARM: {
-        auto cmd_long = mavlink::Pld_command_long::Create();
-        Fill_target_ids(*cmd_long);
-        (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_COMPONENT_ARM_DISARM;
-        (*cmd_long)->param1 = (request_type == Vehicle_command::Type::ARM ? 1 : 0);
-        (*cmd_long)->confirmation = 0;
-        cmd_messages.emplace_back(cmd_long);
-        Register_status_text();
-        break;
-    }
-
-        case Vehicle_command::Type::DIRECT_PAYLOAD_CONTROL: {
-          /*          LOG("Direct Payload %d (rpyz) %1.3f %1.3f %1.3f %1.3f",
-                        vehicle_command_request->Get_payload_id(),
-                        vehicle_command_request->Get_roll(),
-                        vehicle_command_request->Get_pitch(),
-                        vehicle_command_request->Get_yaw(),
-                        vehicle_command_request->Get_zoom()
-                        );
-            );*/
-            px4_vehicle.payload_pitch += vehicle_command_request->Get_pitch() * DIRECT_PAYLOAD_CONTROLLING_COEF;
-            px4_vehicle.payload_yaw += vehicle_command_request->Get_yaw() * DIRECT_PAYLOAD_CONTROLLING_COEF;
-
-            if (px4_vehicle.payload_pitch > 0) {px4_vehicle.payload_pitch = 0;}
-            if (px4_vehicle.payload_pitch < -90) {px4_vehicle.payload_pitch = -90;}
-            if (px4_vehicle.payload_yaw > 180) {px4_vehicle.payload_yaw -= 360;}
-            if (px4_vehicle.payload_yaw < -180) {px4_vehicle.payload_yaw += 360;}
-
-            auto cmd_long = mavlink::Pld_command_long::Create();
-            Fill_target_ids(*cmd_long);
-            (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_DO_MOUNT_CONTROL;
-            (*cmd_long)->param1 = px4_vehicle.payload_pitch;
-            (*cmd_long)->param2 = 0;
-            (*cmd_long)->param3 = px4_vehicle.payload_yaw;
-            (*cmd_long)->param7 = mavlink::MAV_MOUNT_MODE::MAV_MOUNT_MODE_MAVLINK_TARGETING;
-            cmd_messages.emplace_back(cmd_long);
-
-            break;
-        }
-
-    case Vehicle_command::Type::MANUAL_MODE:
-        Set_mode(static_cast<uint8_t>(Px4_main_mode::POSCTL));
-        break;
-
-    case Vehicle_command::Type::AUTO_MODE: {
-        auto set_current = mavlink::Pld_mission_set_current::Create();
-        Fill_target_ids(*set_current);
-        (*set_current)->seq = 0;
-        cmd_messages.emplace_back(set_current);
-        if (!px4_vehicle.is_airborne) {
-            Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_TAKEOFF));
-        }
-        Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_MISSION));
-        break;
-    }
-
-    case Vehicle_command::Type::GUIDED_MODE:
-        if (!px4_vehicle.is_airborne) {
-            Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_TAKEOFF));
-        }
-        Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_LOITER));
-        break;
-
-    case Vehicle_command::Type::RETURN_HOME:
-        Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_RTL));
-        break;
-
-    case Vehicle_command::Type::TAKEOFF:
-        Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_TAKEOFF));
-        break;
-
-    case Vehicle_command::Type::LAND:
-        Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_LAND));
-        break;
-
-    case Vehicle_command::Type::WAYPOINT: // Click & Go
-        if (px4_vehicle.Is_home_position_valid()) {
-            if (!px4_vehicle.is_airborne) {
-                Set_mode(
-                    static_cast<uint8_t>(Px4_main_mode::AUTO),
-                    static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_TAKEOFF));
-            }
-            if (current_control_mode != proto::CONTROL_MODE_CLICK_GO) {
-                Set_mode(
-                    static_cast<uint8_t>(Px4_main_mode::AUTO),
-                    static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_LOITER));
-            }
-
-            if (px4_vehicle.vendor == Px4_vendor::YUNEEC) {
-                VEHICLE_LOG_WRN(vehicle, "Ignoring speed setting as MPC_XY_CRUISE is not supported by Yuneec.");
-            } else {
-                auto param = mavlink::Pld_param_set::Create();
-                Fill_target_ids(*param);
-                (*param)->param_id = "MPC_XY_CRUISE";
-                (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-                (*param)->param_value = vehicle_command_request->Get_speed();
-                cmd_messages.emplace_back(param);
-
-                if (px4_vehicle.max_ground_speed < vehicle_command_request->Get_speed()) {
-                    (*param)->param_id = "MPC_XY_VEL_MAX";
-                    (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-                    (*param)->param_value = vehicle_command_request->Get_speed();
-                    cmd_messages.emplace_back(param);
-                }
-            }
-
-            Do_reposition(
-                vehicle_command_request->Get_latitude(),
-                vehicle_command_request->Get_longitude(),
-                // Convert to vehicle global frame. TODO: rework after altitude calibration feature.
-                px4_vehicle.home_location.altitude +
-                    vehicle_command_request->Get_altitude() -
-                    vehicle_command_request->Get_takeoff_altitude(),
-                vehicle_command_request->Get_heading(),
-                vehicle_command_request->Get_speed());
-        } else {
-            vehicle_command_request.Fail("Invalid home position");
-        }
-        break;
-
-    case Vehicle_command::Type::PAUSE_MISSION:
-        Do_reposition();
-        break;
-
-    case Vehicle_command::Type::RESUME_MISSION:
-        Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_MISSION));
-        break;
-
-    case Vehicle_command::Type::JOYSTICK_CONTROL_MODE: // TODO: Unused at the moment, implement in future
-        if (current_control_mode == proto::CONTROL_MODE_CLICK_GO) {
-            vehicle_command_request.Succeed();
-        } else {
-            Set_mode(static_cast<uint8_t>(Px4_main_mode::AUTO), static_cast<uint8_t>(Px4_auto_sub_mode::AUTO_LOITER));
-        }
-        px4_vehicle.Start_rc_override();
-        break;
-
-    case Vehicle_command::Type::DIRECT_VEHICLE_CONTROL: {  // TODO: Unused at the moment, implement in future
-        if (current_control_mode != proto::CONTROL_MODE_CLICK_GO) {
-            break;
-        }
-        px4_vehicle.direct_vehicle_control_last_received = std::chrono::steady_clock::now();
-        auto pitch = vehicle_command_request->Get_pitch();
-        auto yaw = vehicle_command_request->Get_yaw();
-
-        // Normalize axes depending on vehicle type.
-        if (px4_vehicle.Get_type() == Type::COPTER) {
-            pitch = -pitch;         // pitch is reversed for copter.
-            yaw = yaw * 0.4;    // yaw on copter is too sensitive.
-        } else {
-            yaw = -yaw;     // yaw is reversed for plane.
-        }
-
-        px4_vehicle.Set_rc_override(
-            (vehicle_command_request->Get_roll() * 500.0) + 1500,
-            (pitch * 500.0) + 1500,
-            (vehicle_command_request->Get_throttle() * 500.0) + 1500,
-            (yaw * 500.0) + 1500);
-        px4_vehicle.Send_rc_override();
-        break;
-    }
-
-    default:
-        vehicle_command_request.Fail("Unsupported command");
-        break;
-    }
-
     if (cmd_messages.size()) {
+        auto cmd = cmd_messages.front();
         Send_message(*(cmd_messages.front()));
         Schedule_timer();
         VEHICLE_LOG_DBG(vehicle, "Sending to vehicle: %s", (*(cmd_messages.front())).Dump().c_str());
     } else {
         // Command list is empty, nothing to do.
-        Disable();
+        Disable("Command list empty");
     }
-
     return false;
-}
-
-void // ?
-Px4_vehicle::Start_rc_override()
-{
-    if (rc_override == nullptr) {
-        // Create rc_override message. timer will delete it when vehicle switched to other mode.
-        rc_override = mavlink::Pld_rc_channels_override::Create();
-        rc_override_timer = Timer_processor::Get_instance()->Create_timer(
-            RC_OVERRIDE_PERIOD,
-            Make_callback(&Px4_vehicle::Send_rc_override_timer, Shared_from_this()),
-            Get_completion_ctx());
-    }
-    rc_override_end_counter = RC_OVERRIDE_END_COUNT;
-    // Set larger timeout when turning on joystick mode
-    // to let client more time to understand that joystick commands must be sent, now.
-    direct_vehicle_control_last_received =
-        std::chrono::steady_clock::now() + RC_OVERRIDE_TIMEOUT;
-    Set_rc_override(1500, 1500, 1500, 1500);
-}
-
-void // ?
-Px4_vehicle::Set_rc_override(int p, int r, int t, int y)
-{
-    if (Is_rc_override_active()) {
-        (*rc_override)->chan1_raw = p;
-        (*rc_override)->chan2_raw = r;
-        (*rc_override)->chan3_raw = t;
-        (*rc_override)->chan4_raw = y;
-    }
-}
-
-void // ?
-Px4_vehicle::Stop_rc_override()
-{
-    if (Is_rc_override_active()) {
-        Set_rc_override(0, 0, 0, 0);
-        // initiate countdown
-        rc_override_end_counter = RC_OVERRIDE_END_COUNT - 1;
-    }
-}
-
-void
-Px4_vehicle::Send_rc_override()
-{
-    // Do not send
-    if (rc_override) {
-//        LOG("Direct vehicle %d %d %d %d",
-//            (*rc_override)->chan1_raw.Get(),
-//            (*rc_override)->chan2_raw.Get(),
-//            (*rc_override)->chan3_raw.Get(),
-//            (*rc_override)->chan4_raw.Get()
-//            );
-        mav_stream->Send_message(
-                *rc_override,
-                255,
-                190,
-                Mavlink_vehicle::WRITE_TIMEOUT,
-                Make_timeout_callback(
-                        &Mavlink_vehicle::Write_to_vehicle_timed_out,
-                        Shared_from_this(),
-                        mav_stream),
-                Get_completion_ctx());
-
-        rc_override_last_sent = std::chrono::steady_clock::now();
-        if (rc_override_end_counter < RC_OVERRIDE_END_COUNT && rc_override_end_counter > 0) {
-            rc_override_end_counter--;
-        }
-    }
-}
-
-bool
-Px4_vehicle::Is_rc_override_active()
-{
-    return (rc_override && rc_override_end_counter == RC_OVERRIDE_END_COUNT);
-}
-
-bool
-Px4_vehicle::Send_rc_override_timer()
-{
-    if (rc_override == nullptr) {
-        return false;
-    }
-
-    auto now = std::chrono::steady_clock::now();
-
-    if (now - direct_vehicle_control_last_received > RC_OVERRIDE_TIMEOUT) {
-        // Automatically exit joystick mode if there are no control messages from ucs.
-        Stop_rc_override();
-    }
-
-    if (now - rc_override_last_sent < RC_OVERRIDE_PERIOD) {
-        // Do not spam radio link too much.
-        return true;
-    }
-
-    Send_rc_override();
-
-    if (rc_override_end_counter == 0) {
-        // exiting joystick mode.
-        rc_override = nullptr;
-        return false;
-    }
-    return true;
 }
 
 void
@@ -788,8 +802,7 @@ Px4_vehicle::Vehicle_command_act::Send_next_command()
         VEHICLE_LOG_DBG(vehicle, "Sending to vehicle: %s", (*(cmd_messages.front())).Dump().c_str());
     } else {
         // command chain succeeded.
-        vehicle_command_request.Succeed();
-        Disable();
+        Disable_success();
     }
 }
 
@@ -837,8 +850,7 @@ Px4_vehicle::Vehicle_command_act::On_command_ack(
                 VEHICLE_LOG_DBG(vehicle, "YUNEEC SET_CAMERA_MODE in progress");
             } else {
                 auto p = message->payload->result.Get();
-                vehicle_command_request.Fail("Result: %d (%s)", p, Mav_result_to_string(p).c_str());
-                Disable();
+                Disable("Result: " + std::to_string(p) + " (" + Mav_result_to_string(p).c_str() + ")");
             }
         }
     }
@@ -856,11 +868,7 @@ Px4_vehicle::Vehicle_command_act::On_mission_ack(
             Send_next_command();
         } else {
             auto p = message->payload->type.Get();
-            vehicle_command_request.Fail(
-                "Result: %d (%s)",
-                p,
-                Mav_mission_result_to_string(p).c_str());
-            Disable();
+            Disable("MISSION_ACK result: " + std::to_string(p) + " (" + Mav_mission_result_to_string(p).c_str() + ")");
         }
     }
 }
@@ -889,8 +897,7 @@ Px4_vehicle::Vehicle_command_act::On_param_value(
                 if (message->payload->param_value.Get() == param_value) {
                     Send_next_command();
                 } else {
-                    vehicle_command_request.Fail("PARAM_SET failed");
-                    Disable();
+                    Disable("PARAM_SET failed");
                 }
             }
             break;
@@ -913,59 +920,92 @@ Px4_vehicle::Vehicle_command_act::On_status_text(
 }
 
 void
-Px4_vehicle::Vehicle_command_act::Enable(
-        Vehicle_command_request::Handle vehicle_command_request)
+Px4_vehicle::Vehicle_command_act::Enable()
 {
-    this->vehicle_command_request = vehicle_command_request;
-    if (px4_vehicle.Get_type() == Type::OTHER) {
-        // Commands for unknown vehicles types are not supported.
-        vehicle_command_request.Fail("Unknown vehicle type");
-        Disable();
-        return;
-    }
+    Register_mavlink_handler<mavlink::MESSAGE_ID::COMMAND_ACK>(
+        &Vehicle_command_act::On_command_ack,
+        this,
+        Mavlink_demuxer::COMPONENT_ID_ANY);
 
-    try {
-        Register_mavlink_handler<mavlink::MESSAGE_ID::COMMAND_ACK>(
-            &Vehicle_command_act::On_command_ack,
-            this,
-            Mavlink_demuxer::COMPONENT_ID_ANY);
+    Register_mavlink_handler<mavlink::MESSAGE_ID::MISSION_ACK>(
+        &Vehicle_command_act::On_mission_ack,
+        this,
+        Mavlink_demuxer::COMPONENT_ID_ANY);
 
-        Register_mavlink_handler<mavlink::MESSAGE_ID::MISSION_ACK>(
-            &Vehicle_command_act::On_mission_ack,
-            this,
-            Mavlink_demuxer::COMPONENT_ID_ANY);
+    Register_mavlink_handler<mavlink::MESSAGE_ID::MISSION_CURRENT>(
+        &Vehicle_command_act::On_mission_current,
+        this,
+        Mavlink_demuxer::COMPONENT_ID_ANY);
 
-        Register_mavlink_handler<mavlink::MESSAGE_ID::MISSION_CURRENT>(
-            &Vehicle_command_act::On_mission_current,
-            this,
-            Mavlink_demuxer::COMPONENT_ID_ANY);
-
-        Register_mavlink_handler<mavlink::MESSAGE_ID::PARAM_VALUE>(
-            &Vehicle_command_act::On_param_value,
-            this,
-            Mavlink_demuxer::COMPONENT_ID_ANY);
-    } catch (const Mavlink_demuxer::Duplicate_handler& e) {
-        vehicle_command_request.Fail("Another command in progress");
-        Disable();
-        return;
-    }
+    Register_mavlink_handler<mavlink::MESSAGE_ID::PARAM_VALUE>(
+        &Vehicle_command_act::On_param_value,
+        this,
+        Mavlink_demuxer::COMPONENT_ID_ANY);
 
     remaining_attempts = try_count;
+    current_timeout = retry_timeout;
+
+    cmd_messages.clear();
+
+    for (int c = 0; ucs_request && c < ucs_request->request.device_commands_size(); c++) {
+        auto &vsm_cmd = ucs_request->request.device_commands(c);
+        auto cmd = vehicle.Get_command(vsm_cmd.command_id());
+
+        if (cmd != vehicle.c_direct_vehicle_control && cmd != vehicle.c_direct_payload_control) {
+            // Do not spam log with direct control messages.
+            VEHICLE_LOG_INF(vehicle, "COMMAND %s", vehicle.Dump_command(vsm_cmd).c_str());
+        }
+
+        auto params = cmd->Build_parameter_list(vsm_cmd);
+        if (cmd == vehicle.c_emergency_land) {
+            Process_emergency_land();
+        } else if (cmd == vehicle.c_arm) {
+            Process_arm();
+        } else if (cmd == vehicle.c_disarm) {
+            Process_disarm();
+        } else if (cmd == vehicle.c_takeoff_command) {
+            Process_takeoff();
+        } else if (cmd == vehicle.c_resume) {
+            Process_resume();
+        } else if (cmd == vehicle.c_pause) {
+            Process_pause();
+        } else if (cmd == vehicle.c_auto) {
+            Process_auto();
+        } else if (cmd == vehicle.c_manual) {
+            Process_manual();
+        } else if (cmd == vehicle.c_rth) {
+            Process_rth();
+        } else if (cmd == vehicle.c_land_command) {
+            Process_land();
+        } else if (cmd == vehicle.c_waypoint) {
+            Process_waypoint(params);
+        } else if (cmd == vehicle.c_set_poi) {
+            Process_set_poi(params);
+        } else if (cmd == vehicle.c_guided) {
+            Process_guided();
+        } else if (cmd == vehicle.c_direct_payload_control) {
+            Process_direct_payload_control(params);
+        } else if (cmd == vehicle.c_direct_vehicle_control) {
+            Process_direct_vehicle_control(params);
+        } else if (cmd == vehicle.c_joystick) {
+            Process_joystick();
+        } else {
+            Disable("Unsupported command");
+        }
+    }
+    command_count = cmd_messages.size();
     Try();
 }
 
 void
 Px4_vehicle::Vehicle_command_act::On_disable()
 {
-    Unregister_mavlink_handlers();
     Unregister_status_text();
 
     if (timer) {
         timer->Cancel();
         timer = nullptr;
     }
-
-    vehicle_command_request.Fail();
 }
 
 void
@@ -1026,23 +1066,26 @@ Px4_vehicle::Task_upload::Enable(Vehicle_task_request::Handle request)
         }
     }
 
-    float hl;
-    // HL altitude becomes altitude origin.
-    // Need to set at the very beginning as it is used to specify safe_altitude, too.
-    if (vehicle.t_home_altitude_amsl->Get_value(hl)) {
-        vehicle.Add_status_message("Using current HL altitude as altitude origin for the route.");
-        VEHICLE_LOG_WRN(
-            vehicle,
-            "Using current HL altitude %f m as altitude origin for route.",
-            hl);
-        request->Set_takeoff_altitude(hl);
-    } else {
-        // Older PX4 firmware does not report HL.
-        vehicle.Add_status_message("Cannot determine Home Location. Using altitude origin from route.");
-        VEHICLE_LOG_WRN(
-            vehicle,
-            "Cannot determine Home Location. Using altitude origin %f m from route.",
-            request->Get_takeoff_altitude());
+    if (!request->return_native_route)
+    {
+        // HL altitude becomes altitude origin.
+        // Need to set at the very beginning as it is used to specify safe_altitude, too.
+        float hl;
+        if (vehicle.t_home_altitude_amsl->Get_value(hl)) {
+            vehicle.Add_status_message("Using current HL altitude as altitude origin for the route.");
+            VEHICLE_LOG_WRN(
+                vehicle,
+                "Using current HL altitude %f m as altitude origin for route.",
+                hl);
+            request->Set_takeoff_altitude(hl);
+        } else {
+            // Older PX4 firmware does not report HL.
+            vehicle.Add_status_message("Cannot determine Home Location. Using altitude origin from route.");
+            VEHICLE_LOG_WRN(
+                vehicle,
+                "Cannot determine Home Location. Using altitude origin %f m from route.",
+                request->Get_takeoff_altitude());
+        }
     }
 
     this->request = request;
@@ -1054,6 +1097,15 @@ Px4_vehicle::Task_upload::Enable(Vehicle_task_request::Handle request)
             max_mission_speed,
             Px4_vehicle::MAX_COPTER_SPEED);
         max_mission_speed = MAX_COPTER_SPEED;
+    }
+
+    if (request->return_native_route) {
+        Prepare_task();
+        std::string mission = Generate_wpl(prepared_actions, request->use_crlf_in_native_route);
+        request->ucs_response->mutable_device_response()->set_status(mission);
+        request.Succeed();
+        Disable();
+        return;
     }
 
     Prepare_task_attributes();
@@ -1136,7 +1188,7 @@ Px4_vehicle::Task_upload::Fill_mavlink_mission_item_common(
     Fill_target_ids(msg);
     msg->seq = prepared_actions.size();
 
-    vehicle.current_command_map.Accumulate_route_id(vehicle.Get_mission_item_hash(msg));
+    vehicle.current_command_map.Accumulate_route_id(Get_mission_item_hash(msg));
     vehicle.current_command_map.Add_command_mapping(msg->seq);
 
     switch (msg->command) {
@@ -1150,20 +1202,11 @@ Px4_vehicle::Task_upload::Fill_mavlink_mission_item_common(
     case mavlink::MAV_CMD_VIDEO_START_CAPTURE:
     case mavlink::MAV_CMD_VIDEO_STOP_CAPTURE:
     case mavlink::MAV_CMD_SET_CAMERA_MODE:
-    case mavlink::MAV_CMD_DO_SET_ROI:
-    case mavlink::MAV_CMD_NAV_ROI:
     case mavlink::MAV_CMD_DO_SET_CAM_TRIGG_DIST:
     case mavlink::MAV_CMD_DO_VTOL_TRANSITION:
+    case mavlink::MAV_CMD_DO_SET_ROI_NONE:
         msg->frame = mavlink::MAV_FRAME::MAV_FRAME_MISSION;
         break;
-    case mavlink::MAV_CMD_NAV_WAYPOINT:
-    case mavlink::MAV_CMD_NAV_LOITER_UNLIM:
-    case mavlink::MAV_CMD_NAV_LOITER_TIME:
-    case mavlink::MAV_CMD_NAV_LOITER_TO_ALT:
-    case mavlink::MAV_CMD_NAV_LAND:
-    case mavlink::MAV_CMD_NAV_TAKEOFF:
-    case mavlink::MAV_CMD_NAV_VTOL_LAND:
-    case mavlink::MAV_CMD_NAV_VTOL_TAKEOFF:
     default:
         msg->frame = mavlink::MAV_FRAME::MAV_FRAME_GLOBAL_RELATIVE_ALT;
         break;
@@ -1192,22 +1235,20 @@ Px4_vehicle::Task_upload::On_disable()
 void
 Px4_vehicle::Task_upload::Filter_actions()
 {
-    switch (px4_vehicle.Get_type()) {
-    case Type::COPTER:
+    switch (vehicle.Get_vehicle_type()) {
+    case proto::VEHICLE_TYPE_HELICOPTER:
+    case proto::VEHICLE_TYPE_MULTICOPTER:
+    case proto::VEHICLE_TYPE_VTOL:
         Filter_copter_actions();
         return;
-    case Type::PLANE:
+    case proto::VEHICLE_TYPE_FIXED_WING:
         Filter_plane_actions();
         return;
-    case Type::ROVER:
+    case proto::VEHICLE_TYPE_GROUND:
         Filter_rover_actions();
         return;
-    case Type::OTHER:
-        Filter_other_actions();
-        return;
     }
-    VSM_EXCEPTION(Internal_error_exception, "Unhandled PX4 vehicle type %d.",
-            px4_vehicle.Get_type());
+    VSM_EXCEPTION(Internal_error_exception, "Unhandled PX4 vehicle type %d.", vehicle.Get_vehicle_type());
 }
 
 void
@@ -1324,22 +1365,20 @@ Px4_vehicle::Task_upload::Prepare_task_attributes()
     if (request->attributes == nullptr) {
         return;
     }
-    switch (px4_vehicle.Get_type()) {
-    case Type::COPTER:
+    switch (vehicle.Get_vehicle_type()) {
+    case proto::VEHICLE_TYPE_HELICOPTER:
+    case proto::VEHICLE_TYPE_MULTICOPTER:
+    case proto::VEHICLE_TYPE_VTOL:
         Prepare_copter_task_attributes();
         return;
-    case Type::PLANE:
+    case proto::VEHICLE_TYPE_FIXED_WING:
         Prepare_plane_task_attributes();
         return;
-    case Type::ROVER:
+    case proto::VEHICLE_TYPE_GROUND:
         Prepare_rover_task_attributes();
         return;
-    case Type::OTHER:
-        Prepare_other_task_attributes();
-        return;
     }
-    VSM_EXCEPTION(Internal_error_exception, "Unhandled PX4 vehicle type %d",
-            px4_vehicle.Get_type());
+    VSM_EXCEPTION(Internal_error_exception, "Unhandled PX4 vehicle type %d", vehicle.Get_vehicle_type());
 }
 
 void // ?
@@ -1436,12 +1475,6 @@ Px4_vehicle::Task_upload::Prepare_rover_task_attributes()
     /* Add rover specific task attributes */
 }
 
-void // ?
-Px4_vehicle::Task_upload::Prepare_other_task_attributes()
-{
-    /* Stub. */
-}
-
 void
 Px4_vehicle::Task_upload::Prepare_action(Action::Ptr action)
 {
@@ -1467,8 +1500,12 @@ Px4_vehicle::Task_upload::Prepare_action(Action::Ptr action)
     case Action::Type::SET_HOME:
         // Setting HL not supported for PX4. It always resets HL to current position on ARM.
         return;
-    case Action::Type::POI: // ?
-        // Prepare_POI(action);
+    case Action::Type::POI:
+        if (px4_vehicle.set_poi_supported) {
+            Prepare_POI(action);
+        } else {
+            VEHICLE_LOG_ERR(vehicle, "Ignoring set_poi. Not supported in PX4 version < 1.8");
+        }
         return;
     case Action::Type::HEADING:
         Prepare_heading(action);
@@ -1568,7 +1605,7 @@ Px4_vehicle::Task_upload::Prepare_move(Action::Ptr& action)
             // Set heading to next waypoint as yaw angle.
             current_heading = heading_to_this_wp;
         }
-        if ((last_move_action || takeoff_action) && px4_vehicle.Get_type() == Type::COPTER) {
+        if ((last_move_action || takeoff_action) && vehicle.Is_copter()) {
             // Autoheading is copter specific.
             if (px4_vehicle.autoheading) {
                 LOG("Set Autoheading to %f", current_heading);
@@ -1685,20 +1722,8 @@ Px4_vehicle::Task_upload::Prepare_change_speed(Action::Ptr& action)
 
     mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_CHANGE_SPEED;
-    switch (px4_vehicle.Get_type()) {
-    case Type::COPTER:
-        (*mi)->param1 = 1; /* Ground Speed */
-        (*mi)->param2 = la->speed;
-        break;
-    case Type::ROVER:
-    default:
-        /* Ground rover takes only airspeed into account, others seems to
-         * take both, but we have only airspeed from UCS, so use only air. */
-        (*mi)->param1 = 0; /* Airspeed. */
-        (*mi)->param2 = la->speed;
-        break;
-    }
-
+    (*mi)->param1 = 1; /* Ground Speed */
+    (*mi)->param2 = la->speed;
     (*mi)->param3 = -1; /* Throttle no change. */
     Add_mission_item(mi);
 }
@@ -1707,15 +1732,19 @@ void
 Px4_vehicle::Task_upload::Prepare_POI(Action::Ptr& action)
 {
     Poi_action::Ptr pa = action->Get_action<Action::Type::POI>();
+    mavlink::Pld_mission_item::Ptr mi;
     if (pa->active) {
         // Set up POI for succeeding waypoints.
         current_mission_poi = pa->position.Get_geodetic();
-        Add_mission_item(Build_roi_mission_item(*current_mission_poi));
+        mi = Build_roi_mission_item(*current_mission_poi);
         first_mission_poi_set = true;
     } else {
         // Reset POI. Generate next WPs as heading from now on.
+        mi = mavlink::Pld_mission_item::Create();
+        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_ROI_NONE;
         current_mission_poi.Disengage();
     }
+    Add_mission_item(mi);
 }
 
 void
@@ -1877,17 +1906,11 @@ Px4_vehicle::Task_upload::Prepare_camera_control(Action::Ptr& action)
     Add_mission_item(mi);
 }
 
-mavlink::Pld_mission_item::Ptr // ?
+mavlink::Pld_mission_item::Ptr
 Px4_vehicle::Task_upload::Build_roi_mission_item(const Geodetic_tuple& coords)
 {
     mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_ROI;
-    if (coords.latitude == 0 && coords.longitude == 0 && coords.altitude == 0)
-    {
-        (*mi)->param1 = mavlink::MAV_ROI::MAV_ROI_NONE;
-    } else {
-        (*mi)->param1 = mavlink::MAV_ROI::MAV_ROI_LOCATION;
-    }
+    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_ROI_LOCATION;
     Fill_mavlink_mission_item_coords(*mi, coords, 0);
     return mi;
 }
@@ -1980,6 +2003,10 @@ Px4_vehicle::Process_heartbeat(
         t_control_mode->Set_value_na();
     }
 
+    if (Is_control_mode(proto::CONTROL_MODE_MANUAL) && direct_vehicle_control) {
+        t_control_mode->Set_value(proto::CONTROL_MODE_JOYSTICK);
+    }
+
     bool was_armed = false;
     t_is_armed->Get_value(was_armed);
 
@@ -2009,9 +2036,8 @@ Px4_vehicle::Update_capability_states()
 {
     int current_control_mode;
     t_control_mode->Get_value(current_control_mode);
-
-    c_direct_payload_control->Set_enabled(true);
-
+    c_direct_vehicle_control->Set_enabled(Is_control_mode(proto::CONTROL_MODE_JOYSTICK));
+    c_direct_vehicle_control->Set_available(Is_control_mode(proto::CONTROL_MODE_JOYSTICK));
     c_manual->Set_enabled(current_control_mode != proto::CONTROL_MODE_MANUAL);
     c_disarm->Set_enabled(Is_armed() && !is_airborne);
     if (Is_armed() && is_airborne) {
@@ -2022,6 +2048,7 @@ Px4_vehicle::Update_capability_states()
         c_land_command->Set_enabled();
         c_pause->Set_enabled(!Is_control_mode(proto::CONTROL_MODE_MANUAL) && !Is_flight_mode(proto::FLIGHT_MODE_HOLD));
         c_resume->Set_enabled(Is_flight_mode(proto::FLIGHT_MODE_HOLD));
+        c_joystick->Set_enabled(!Is_control_mode(proto::CONTROL_MODE_JOYSTICK));
         c_rth->Set_enabled();
         c_takeoff_command->Set_enabled(false);
         c_arm->Set_enabled(false);
@@ -2033,6 +2060,7 @@ Px4_vehicle::Update_capability_states()
         c_land_command->Set_enabled(false);
         c_pause->Set_enabled(false);
         c_resume->Set_enabled(false);
+        c_joystick->Set_enabled(false);
         c_rth->Set_enabled(false);
         c_takeoff_command->Set_enabled(Is_armed());
         c_arm->Set_enabled(!Is_armed() && current_control_mode != proto::CONTROL_MODE_AUTO);
@@ -2049,14 +2077,49 @@ Px4_vehicle::On_extended_sys_state(
 }
 
 void
-Px4_vehicle::Configure()
+Px4_vehicle::Configure_common()
 {
-    // TODO: Add PX4 configuration
+    Set_rc_loss_actions({
+        proto::FAILSAFE_ACTION_RTH,
+        proto::FAILSAFE_ACTION_CONTINUE,
+        proto::FAILSAFE_ACTION_WAIT,
+        proto::FAILSAFE_ACTION_LAND
+        });
+
+    Set_low_battery_actions({
+        proto::FAILSAFE_ACTION_RTH,
+        proto::FAILSAFE_ACTION_CONTINUE,
+        proto::FAILSAFE_ACTION_LAND
+        });
+
     auto props = Properties::Get_instance().get();
     camera_trigger_type = props->Get_int("vehicle.px4.camera_trigger_type");
     camera_servo_idx = props->Get_int("vehicle.px4.camera_servo_idx");
     camera_servo_pwm = props->Get_int("vehicle.px4.camera_servo_pwm");
     camera_servo_time = props->Get_float("vehicle.px4.camera_servo_time");
+
+    if (props->Exists("vehicle.px4.autoheading")) {
+        auto yes = props->Get("vehicle.px4.autoheading");
+        if (yes == "no") {
+            autoheading = false;
+        } else if (yes == "yes") {
+            autoheading = true;
+        } else {
+            LOG_ERR("Invalid value '%s' for autoheading", yes.c_str());
+        }
+
+        if (autoheading) {
+            VEHICLE_LOG_INF((*this), "Autoheading is on.");
+        } else {
+            VEHICLE_LOG_INF((*this), "Autoheading is off.");
+        }
+    }
+}
+
+void
+Px4_vehicle::Configure_real_vehicle()
+{
+    auto props = Properties::Get_instance().get();
     if (props->Exists("vehicle.px4.enable_joystick_control_for_fixed_wing")) {
         auto yes = props->Get("vehicle.px4.enable_joystick_control_for_fixed_wing");
         if (yes == "yes") {
@@ -2091,23 +2154,6 @@ Px4_vehicle::Configure()
             use_mavlink_2.Disengage();
         } else {
             LOG_ERR("Invalid value '%s' for mavlink_protocol_version", value.c_str());
-        }
-    }
-
-    if (props->Exists("vehicle.px4.autoheading")) {
-        auto yes = props->Get("vehicle.px4.autoheading");
-        if (yes == "no") {
-            autoheading = false;
-        } else if (yes == "yes") {
-            autoheading = true;
-        } else {
-            LOG_ERR("Invalid value '%s' for autoheading", yes.c_str());
-        }
-
-        if (autoheading) {
-            VEHICLE_LOG_INF((*this), "Autoheading is on.");
-        } else {
-            VEHICLE_LOG_INF((*this), "Autoheading is off.");
         }
     }
 
@@ -2165,6 +2211,15 @@ Px4_vehicle::Configure()
         telemetry_rates[mavlink::VFR_HUD];
 
     LOG("Setting expected telemetry_rate to %0.2f", expected_telemetry_rate);
+
+    if (props->Exists("mavlink.vsm_system_id")) {
+        int sid = props->Get_int("mavlink.vsm_system_id");
+        if (sid > 0 && sid < 255) {
+            vsm_system_id = sid;
+        } else {
+            VEHICLE_LOG_ERR((*this), "Invalid value '%d' for vsm_system_id", sid);
+        }
+    }
 }
 
 const char*

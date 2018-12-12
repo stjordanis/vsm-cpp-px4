@@ -13,6 +13,7 @@ Mavlink_vehicle_manager(
         "PX4",
         "vehicle.px4")
 {
+    copter_processor = Px4_vehicle::Create(proto::VEHICLE_TYPE_MULTICOPTER);
 }
 
 void
@@ -26,6 +27,7 @@ Px4_vehicle_manager::Register_detectors()
             ugcs::vsm::Optional<std::string>(),
             ugcs::vsm::Optional<std::string>()),
         Shared_from_this());
+    copter_processor->Enable();
 }
 
 Mavlink_vehicle::Ptr
@@ -33,11 +35,13 @@ Px4_vehicle_manager::Create_mavlink_vehicle(
         Mavlink_demuxer::System_id system_id,
         Mavlink_demuxer::Component_id component_id,
         mavlink::MAV_TYPE type,
-        Io_stream::Ref stream,
+        Mavlink_stream::Ptr stream,
         ugcs::vsm::Socket_address::Ptr,
         ugcs::vsm::Optional<std::string> mission_dump_path,
         const std::string& serial_number,
-        const std::string& model_name)
+        const std::string& model_name,
+        ugcs::vsm::Request_processor::Ptr proc,
+        ugcs::vsm::Request_completion_context::Ptr comp)
 {
     return Px4_vehicle::Create(
             system_id,
@@ -46,5 +50,13 @@ Px4_vehicle_manager::Create_mavlink_vehicle(
             stream,
             mission_dump_path,
             serial_number,
-            model_name);
+            model_name,
+            proc,
+            comp);
+}
+
+void
+Px4_vehicle_manager::On_manager_disable()
+{
+    copter_processor->Disable();
 }
