@@ -94,7 +94,6 @@ Px4_vehicle::On_enable()
     REG_DISABLER(ATTITUDE_TARGET);
     REG_DISABLER(ATTITUDE_QUATERNION);
     REG_DISABLER(ACTUATOR_CONTROL_TARGET);
-    REG_DISABLER(GPS_RAW_INT);
     REG_DISABLER(TIMESYNC);
     REG_DISABLER(POSITION_TARGET_LOCAL_NED);
     REG_DISABLER(SERVO_OUTPUT_RAW);
@@ -181,6 +180,10 @@ Px4_vehicle::On_autopilot_version(
 
     if (maj > 1 || (maj == 1 && min >= 8)) {
         set_poi_supported = true;
+    }
+
+    if (maj > 1 || (maj == 1 && min >= 9)) {
+        yaw_mode_str = "MPC_YAW_MODE";
     }
 
     if (!protocol_version_detected) {
@@ -1456,7 +1459,7 @@ Px4_vehicle::Task_upload::Prepare_copter_task_attributes()
         // Do not modify MIS_YAWMODE if autoheading is not set.
         if (px4_vehicle.autoheading) {
             // Set yaw mode to WP-defined
-            task_attributes.Append_int_px4("MIS_YAWMODE", YAWMODE_WP_DEFINED);
+            task_attributes.Append_int_px4(px4_vehicle.yaw_mode_str, YAWMODE_WP_DEFINED);
         }
     }
 }
@@ -2141,6 +2144,7 @@ Px4_vehicle::Configure_real_vehicle()
         }
     }
 
+    // This is deprecated. use mavlink.protocol_version instead.
     if (props->Exists("vehicle.px4.mavlink_protocol_version")) {
         auto value = props->Get("vehicle.px4.mavlink_protocol_version");
         Trim(value);
@@ -2211,15 +2215,6 @@ Px4_vehicle::Configure_real_vehicle()
         telemetry_rates[mavlink::VFR_HUD];
 
     LOG("Setting expected telemetry_rate to %0.2f", expected_telemetry_rate);
-
-    if (props->Exists("mavlink.vsm_system_id")) {
-        int sid = props->Get_int("mavlink.vsm_system_id");
-        if (sid > 0 && sid < 255) {
-            vsm_system_id = sid;
-        } else {
-            VEHICLE_LOG_ERR((*this), "Invalid value '%d' for vsm_system_id", sid);
-        }
-    }
 }
 
 const char*

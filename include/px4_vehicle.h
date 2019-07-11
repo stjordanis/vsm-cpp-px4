@@ -674,11 +674,11 @@ private:
     // Current mission hash.
     uint32_t current_route_id;
 
-    // Force use of specific mavlink version.
-    ugcs::vsm::Optional<bool> use_mavlink_2;
-
     /** by default autoheading is turned on */
     bool autoheading = true;
+
+    // In later px4 versions this parameter is renamed to MPC_YAW_MODE
+    std::string yaw_mode_str = "MIS_YAWMODE";
 };
 
 #endif /* _PX4_VEHICLE_H_ */

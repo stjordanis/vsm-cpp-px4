@@ -340,21 +340,6 @@ It is possible to configure rate for each message type separately.
         vehicle.px4.telemetry_rate.SYS_STATUS = 0.5
         vehicle.px4.telemetry_rate.VFR_HUD = 0.5
 
-@subsection mavlink_version Mavlink version
-
-PX4 VSM supports MAVLink versions 1 and 2 and detects the correct version automatically. In setups when
-there is some intermediate device between VSM and autopilot this detection can fail.
-For those scenarios it is possible to force mavlink version used by VSM.
-
-- @b Required: No.
-- @b Supported @b values: 1 2 auto
-- @b Default: auto
-- @b Description: 1: always use mavlink version 1, 2: always use mavlink version 2, auto: Autodetect mavlink version.
-
-- @b Example:
-
-        vehicle.px4.mavlink_protocol_version = 1
-
 @subsection auto_heading Force heading to next WP
 
 By default VSM will automatically generate commands for vehicle to set heading towards next waypoint.
@@ -383,7 +368,8 @@ The prefix mavlink_injection supports all the same syntax as "connection" prefix
 - @b Default: Not set.
 - @b Example:
 
-        mavlink_injection.udp_any.1.local_port = 44444
+        mavlink.injection.udp_any.1.local_port = 44444
+
 
 @subsection mavlink_sysid Mavlink System ID
 
@@ -395,5 +381,20 @@ MAVlink System ID used for outgoing MAVlink messages.
 - @b Example:
 
         mavlink.vsm_system_id = 100
+
+
+@subsection protocol_version Mavlink protocol version
+
+MAVlink Protocol version used for messages generated on VSM. There are three options:<br>
+1 - Always use MAVLINK1 (default)<br>
+2 - Always use MAVLINK2<br>
+auto - Detect autopilot capabilities and use MAVLINK2 if autopilot reports MAV_PROTOCOL_CAPABILITY_MAVLINK2<br>
+
+- @b Required: No.
+- @b Supported @b values: 1, 2, auto
+- @b Default: 1
+- @b Example:
+
+        mavlink.protocol_version = 2
 
 */
